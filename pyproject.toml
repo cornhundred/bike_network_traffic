@@ -1,0 +1,122 @@
+[build-system]
+requires = ["hatchling>=1.26.1", "hatch-jupyter-builder>=0.5.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bike_network_traffic"
+version = "0.1.0"
+description = "Jupyter anywidget: deck.gl bike station flow map linked to Celldega clustergrams"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "bike_network_traffic contributors" }]
+keywords = ["jupyter", "widget", "anywidget", "deck.gl", "bikes"]
+classifiers = [
+  "Framework :: Jupyter",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+  "anywidget>=0.9.0",
+  "ipywidgets>=8.0.0",
+  "traitlets>=5.0",
+]
+
+[project.optional-dependencies]
+pandas = ["pandas>=2.0"]
+dev = [
+  "jupyterlab>=4.0",
+  "pandas>=2.0",
+  "ruff",
+  "pytest>=8.0",
+  "build",
+  "twine",
+]
+
+[project.urls]
+Homepage = "https://github.com/broadinstitute/celldega"
+Source = "https://github.com/broadinstitute/celldega/tree/bikes/notebooks"
+
+# Default Hatch env (e.g. `hatch shell`) pulls in dev tools — same pattern as Celldega.
+[tool.hatch.envs.default]
+features = ["dev"]
+
+[tool.hatch.envs.default.scripts]
+lint = "ruff check src tests {args}"
+format = "ruff format src tests {args}"
+fmt = "ruff format src tests {args}"
+all = ["lint", "format"]
+
+[tool.hatch.envs.test]
+dependencies = ["pytest>=8.0"]
+
+[tool.hatch.envs.test.scripts]
+test = "pytest {args:tests}"
+
+[tool.hatch.build]
+only-packages = true
+artifacts = ["src/bike_network_traffic/bundled/widget.js"]
+
+[tool.hatch.build.hooks.jupyter-builder]
+build-function = "hatch_jupyter_builder.npm_builder"
+ensured-targets = ["src/bike_network_traffic/bundled/widget.js"]
+skip-if-exists = ["src/bike_network_traffic/bundled/widget.js"]
+dependencies = ["hatch-jupyter-builder>=0.5.0"]
+
+[tool.hatch.build.hooks.jupyter-builder.build-kwargs]
+path = "js"
+npm = "npm"
+build_cmd = "build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bike_network_traffic"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/js", "/pyproject.toml"]
+
+[tool.ruff]
+exclude = [
+  ".git",
+  ".venv",
+  ".eggs",
+  ".mypy_cache",
+  ".pytest_cache",
+  ".ruff_cache",
+  "build",
+  "dist",
+  "js/node_modules",
+  "node_modules",
+]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+  "E4",
+  "E7",
+  "E9",
+  "F",
+  "B",
+  "I",
+  "UP",
+  "RUF",
+]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["bike_network_traffic"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = ["-v", "--tb=short"]

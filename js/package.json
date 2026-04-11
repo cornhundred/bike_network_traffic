@@ -1,0 +1,21 @@
+{
+  "name": "bike-network-traffic-js",
+  "private": true,
+  "scripts": {
+    "build": "esbuild bike_flow_map_widget.mjs --bundle --format=esm --outfile=../src/bike_network_traffic/bundled/widget.js --platform=browser --target=es2022 --legal-comments=none --define:define.amd=false"
+  },
+  "dependencies": {
+    "deck.gl": "9.0.35"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  },
+  "overrides": {
+    "@luma.gl/constants": "9.0.27",
+    "@luma.gl/core": "9.0.27",
+    "@luma.gl/engine": "9.0.27",
+    "@luma.gl/gltf": "9.0.27",
+    "@luma.gl/shadertools": "9.0.27",
+    "@luma.gl/webgl": "9.0.27"
+  }
+}
