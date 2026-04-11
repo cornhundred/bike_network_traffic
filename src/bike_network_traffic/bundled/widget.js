@@ -45294,7 +45294,7 @@ function fitViewState(stations) {
   const latitude = (minLat + maxLat) / 2;
   const longitude = (minLng + maxLng) / 2;
   const span = Math.max(maxLat - minLat, maxLng - minLng, 0.02);
-  const zoom = Math.min(14, Math.max(9, 12 - Math.log2(span * 80)));
+  const zoom = Math.min(14, Math.max(10, 13 - Math.log2(span * 80)));
   return { latitude, longitude, zoom, pitch: 0, bearing: 0 };
 }
 function render({ model, el }) {
