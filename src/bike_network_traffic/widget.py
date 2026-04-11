@@ -26,3 +26,4 @@ class BikeFlowMapWidget(anywidget.AnyWidget):
     matrix_slice_request_out = traitlets.Dict(default_value={}).tag(sync=True)
     cg_row_names = traitlets.List(default_value=[]).tag(sync=True)
     cg_col_names = traitlets.List(default_value=[]).tag(sync=True)
+    spatial_mix = traitlets.Float(0.0).tag(sync=True)

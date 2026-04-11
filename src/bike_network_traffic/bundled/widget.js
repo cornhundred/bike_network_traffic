@@ -45085,7 +45085,9 @@ var createStore = () => ({
   deck_check: Observable({ inputs: true, computed: true, layers: true }),
   deck_ready: Observable(false),
   palette_rgb: Observable([]),
-  matrix_axis_slice: Observable({})
+  matrix_axis_slice: Observable({}),
+  spatial_mix: Observable(0),
+  hovered_cluster: Observable(null)
 });
 var log3 = (store, ...args) => {
   if (store.debug.get()) console.log("[bike-map]", ...args);
@@ -45146,13 +45148,14 @@ var setDerivedState = (store, { focus, highlights, edges }) => {
   }
   return changed;
 };
-function basemapLayer() {
+function basemapLayer(opacity = 255) {
   return new tile_layer_default({
     id: "bike-basemap",
     data: "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
     minZoom: 0,
     maxZoom: 19,
     tileSize: 256,
+    opacity: opacity / 255,
     renderSubLayers: (props) => {
       if (!props.data || !props.tile) return null;
       let west;
@@ -45300,7 +45303,42 @@ function render({ model, el }) {
   root.style.background = "#e2e4e8";
   root.style.borderRadius = "4px";
   root.style.overflow = "hidden";
+  root.style.position = "relative";
   el.appendChild(root);
+  const controlPanel = document.createElement("div");
+  controlPanel.style.cssText = "position:absolute;top:10px;right:10px;background:rgba(255,255,255,0.92);padding:8px 14px;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,0.15);z-index:1;font:12px system-ui,sans-serif;user-select:none;display:none;";
+  const sliderLabel = document.createElement("div");
+  sliderLabel.style.cssText = "margin-bottom:4px;color:#444;font-weight:500;";
+  sliderLabel.textContent = "Spatial \u2194 UMAP";
+  const slider = document.createElement("input");
+  slider.type = "range";
+  slider.min = "0";
+  slider.max = "1";
+  slider.step = "0.01";
+  slider.value = "0";
+  slider.style.cssText = "width:140px;cursor:pointer;";
+  slider.addEventListener("input", () => {
+    const t2 = parseFloat(slider.value);
+    store.spatial_mix.set(t2);
+    model.set("spatial_mix", t2);
+    model.save_changes();
+  });
+  controlPanel.appendChild(sliderLabel);
+  controlPanel.appendChild(slider);
+  for (const evt of ["pointerdown", "pointermove", "pointerup", "wheel", "dblclick"]) {
+    controlPanel.addEventListener(evt, (e2) => e2.stopPropagation());
+  }
+  root.appendChild(controlPanel);
+  store.stations.subscribe((stations) => {
+    const hasUmap = stations.some((s2) => s2.umap_lng != null && s2.umap_lat != null);
+    controlPanel.style.display = hasUmap ? "block" : "none";
+  }, { immediate: true });
+  root.addEventListener("mouseleave", () => {
+    if (store.hovered_cluster.get() != null) {
+      store.hovered_cluster.set(null);
+      scheduleRender();
+    }
+  });
   let deck = null;
   let raf = 0;
   let renderVersion = 0;
@@ -45571,7 +45609,7 @@ function render({ model, el }) {
     const highlights = new Set(highlightArr);
     const edges = store.edges.get() || [];
     const stationNameSet = new Set(stations.map((d2) => d2.name));
-    const overlap = highlightArr.filter((n2) => stationNameSet.has(n2));
+    const overlap = highlightArr.filter((n3) => stationNameSet.has(n3));
     log3(store, "buildLayers", {
       focus,
       highlightCount: highlightArr.length,
@@ -45582,11 +45620,38 @@ function render({ model, el }) {
       version: renderVersion
     });
     const hasSel = Boolean(focus) || highlights.size > 0;
+    const spatialMix = store.spatial_mix.get();
+    const hoveredCluster = store.hovered_cluster.get();
+    const posLookup = {};
+    let geoSumLng = 0, geoSumLat = 0, umapSumLng = 0, umapSumLat = 0, umapN = 0;
+    for (const s2 of stations) {
+      geoSumLng += Number(s2.lng);
+      geoSumLat += Number(s2.lat);
+      if (s2.umap_lng != null && s2.umap_lat != null) {
+        umapSumLng += Number(s2.umap_lng);
+        umapSumLat += Number(s2.umap_lat);
+        umapN += 1;
+      }
+    }
+    const n2 = stations.length || 1;
+    const geoCenterLng = geoSumLng / n2, geoCenterLat = geoSumLat / n2;
+    const umapCenterLng = umapN ? umapSumLng / umapN : geoCenterLng;
+    const umapCenterLat = umapN ? umapSumLat / umapN : geoCenterLat;
+    const dLng = geoCenterLng - umapCenterLng, dLat = geoCenterLat - umapCenterLat;
+    for (const s2 of stations) {
+      const t2 = spatialMix;
+      const hasUmap = s2.umap_lng != null && s2.umap_lat != null;
+      const uLng = hasUmap ? Number(s2.umap_lng) + dLng : Number(s2.lng);
+      const uLat = hasUmap ? Number(s2.umap_lat) + dLat : Number(s2.lat);
+      const lng = Number(s2.lng) * (1 - t2) + uLng * t2;
+      const lat = Number(s2.lat) * (1 - t2) + uLat * t2;
+      posLookup[s2.name] = [lng, lat];
+    }
     const { out, inn } = getLinkedWeights();
     const highlightKey = Array.from(highlights).sort().join("|");
     const outKey = Array.from(out.entries()).map(([k2, v2]) => `${k2}:${v2}`).sort().join("|");
     const inKey = Array.from(inn.entries()).map(([k2, v2]) => `${k2}:${v2}`).sort().join("|");
-    const styleKey = `${focus}__${highlightKey}__${outKey}__${inKey}__${hasSel}`;
+    const styleKey = `${focus}__${highlightKey}__${outKey}__${inKey}__${hasSel}__${spatialMix}__${hoveredCluster}`;
     let peakLinkWeight = 0;
     for (const v2 of out.values()) peakLinkWeight = Math.max(peakLinkWeight, v2);
     for (const v2 of inn.values()) peakLinkWeight = Math.max(peakLinkWeight, v2);
@@ -45594,9 +45659,9 @@ function render({ model, el }) {
     let hubSumIn = 0;
     for (const v2 of out.values()) hubSumOut += Number(v2) || 0;
     for (const v2 of inn.values()) hubSumIn += Number(v2) || 0;
-    const linkedRadius = (n2) => {
-      const wo = out.has(n2) ? Math.min(1, Math.max(0, out.get(n2) || 0)) : 0;
-      const wi = inn.has(n2) ? Math.min(1, Math.max(0, inn.get(n2) || 0)) : 0;
+    const linkedRadius = (n3) => {
+      const wo = out.has(n3) ? Math.min(1, Math.max(0, out.get(n3) || 0)) : 0;
+      const wi = inn.has(n3) ? Math.min(1, Math.max(0, inn.get(n3) || 0)) : 0;
       const w2 = Math.max(wo, wi);
       return 100 + 125 * Math.sqrt(w2);
     };
@@ -45610,23 +45675,23 @@ function render({ model, el }) {
       radiusUnits: "meters",
       radiusMinPixels: 3,
       radiusMaxPixels: 56,
-      getPosition: (d2) => [Number(d2.lng), Number(d2.lat)],
+      getPosition: (d2) => posLookup[d2.name] || [Number(d2.lng), Number(d2.lat)],
       getRadius: (d2) => {
-        const n2 = d2.name;
-        if (focus && n2 === focus) return focusHubRadius();
-        if (focus && (out.has(n2) || inn.has(n2))) return linkedRadius(n2);
-        if (highlights.has(n2)) return 90;
+        const n3 = d2.name;
+        if (focus && n3 === focus) return focusHubRadius();
+        if (focus && (out.has(n3) || inn.has(n3))) return linkedRadius(n3);
+        if (highlights.has(n3)) return 90;
         return hasSel ? 70 : 90;
       },
       getFillColor: (d2) => {
-        const n2 = d2.name;
+        const n3 = d2.name;
         if (focus) {
-          if (n2 === focus) {
+          if (n3 === focus) {
             return flowBlendWithAlpha(hubSumOut, hubSumIn, 248);
           }
-          if (out.has(n2) || inn.has(n2)) {
-            const wo = out.has(n2) ? Math.max(0, out.get(n2) || 0) : 0;
-            const wi = inn.has(n2) ? Math.max(0, inn.get(n2) || 0) : 0;
+          if (out.has(n3) || inn.has(n3)) {
+            const wo = out.has(n3) ? Math.max(0, out.get(n3) || 0) : 0;
+            const wi = inn.has(n3) ? Math.max(0, inn.get(n3) || 0) : 0;
             const w2 = Math.max(wo, wi);
             const a2 = Math.round(148 + 102 * Math.sqrt(Math.min(1, w2)));
             return flowBlendWithAlpha(wo, wi, a2);
@@ -45635,44 +45700,56 @@ function render({ model, el }) {
         }
         if (highlights.size > 0) {
           const c2 = clusterFillColor(d2.cluster_id, palRgb);
-          if (highlights.has(n2)) return [c2[0], c2[1], c2[2], 242];
+          if (highlights.has(n3)) return [c2[0], c2[1], c2[2], 242];
           return [c2[0], c2[1], c2[2], 36];
+        }
+        if (hoveredCluster != null) {
+          if (d2.cluster_id === hoveredCluster) return clusterFillWithAlpha(d2.cluster_id, 248, palRgb);
+          return clusterFillWithAlpha(d2.cluster_id, 50, palRgb);
         }
         return clusterFillColor(d2.cluster_id, palRgb);
       },
       updateTriggers: {
         getRadius: [styleKey, renderVersion],
-        getFillColor: [styleKey, renderVersion]
+        getFillColor: [styleKey, renderVersion],
+        getPosition: [spatialMix, renderVersion]
+      },
+      onHover: (info) => {
+        const cid = info.object ? info.object.cluster_id : null;
+        if (store.hovered_cluster.get() !== cid) {
+          store.hovered_cluster.set(cid);
+          scheduleRender();
+        }
       },
       onClick: (info) => {
         if (!info.object) return;
-        const n2 = String(info.object.name || "").trim();
-        if (store.focus.get() === n2) {
+        const n3 = String(info.object.name || "").trim();
+        if (store.focus.get() === n3) {
           setDerivedState(store, { focus: "", highlights: [], edges: [] });
           lastActionKey = null;
           model.set("click_info", {});
           model.set("matrix_axis_slice", {});
           model.save_changes();
           scheduleRender();
-          log3(store, "map toggle off", n2);
+          log3(store, "map toggle off", n3);
           return;
         }
         const rowNames = model.get("cg_row_names") || [];
         const colNames = model.get("cg_col_names") || [];
-        const rowIx = findAxisIndex(rowNames, n2);
-        const colIx = findAxisIndex(colNames, n2);
+        const rowIx = findAxisIndex(rowNames, n3);
+        const colIx = findAxisIndex(colNames, n3);
         if (rowIx < 0 || colIx < 0) {
-          log3(store, "map click: missing matrix axis index", n2, "row", rowIx, "col", colIx);
+          log3(store, "map click: missing matrix axis index", n3, "row", rowIx, "col", colIx);
           return;
         }
         model.set("click_info", {});
         model.set("matrix_axis_slice", {});
         model.save_changes();
         pushRowColMatrixSliceRequest(model, rowIx, colIx);
-        setDerivedState(store, { focus: n2, highlights: [n2], edges: [] });
+        setDerivedState(store, { focus: n3, highlights: [n3], edges: [] });
         lastActionKey = null;
         scheduleRender();
-        log3(store, "map click -> row_col request", n2, rowIx, colIx);
+        log3(store, "map click -> row_col request", n3, rowIx, colIx);
       }
     });
     const lineWidthFor = (d2) => {
@@ -45692,11 +45769,13 @@ function render({ model, el }) {
       id: "bike-flow-lines",
       data: edges,
       widthUnits: "pixels",
-      getSourcePosition: (d2) => d2.source,
-      getTargetPosition: (d2) => d2.target,
+      getSourcePosition: (d2) => posLookup[d2.source_name] || d2.source,
+      getTargetPosition: (d2) => posLookup[d2.target_name] || d2.target,
       getWidth: lineWidthFor,
       updateTriggers: {
-        getWidth: [styleKey, renderVersion]
+        getWidth: [styleKey, renderVersion],
+        getSourcePosition: [spatialMix, renderVersion],
+        getTargetPosition: [spatialMix, renderVersion]
       },
       getColor: (d2) => {
         const a2 = Math.round(Math.max(0, Math.min(1, Number(d2.opacity) || 0)) * 255);
@@ -45705,7 +45784,8 @@ function render({ model, el }) {
         return [255, 240, 120, a2];
       }
     });
-    return [basemapLayer(), lines, points];
+    const basemapAlpha = Math.round(255 * (1 - spatialMix));
+    return [basemapLayer(basemapAlpha), lines, points];
   };
   let pendingProps = null;
   const prepareDeckProps = () => {
@@ -45718,13 +45798,14 @@ function render({ model, el }) {
       parent: root,
       width: w2,
       height: h2,
-      controller: true,
+      controller: { doubleClickZoom: false },
       layers: buildLayers(),
       getTooltip: ({ object, layer }) => {
         if (!object || layer.id !== "bike-stations") return null;
-        const sid = object.station_id != null ? String(object.station_id) : "";
         const nm = object.name != null ? String(object.name) : "";
-        const html = sid ? `<div style="font:12px system-ui,sans-serif;"><b>id</b> ${sid}<br/><b>name</b> ${nm}</div>` : `<div style="font:12px system-ui,sans-serif;">${nm}</div>`;
+        const cid = object.cluster_id != null ? String(object.cluster_id) : "";
+        const clusterLine = cid && cid !== "0" ? `<br/><span style="color:#666;">Cluster ${cid}</span>` : "";
+        const html = `<div style="font:12px system-ui,sans-serif;"><b>${nm}</b>${clusterLine}</div>`;
         return {
           html,
           style: {
@@ -45797,7 +45878,8 @@ function render({ model, el }) {
     store.width,
     store.height,
     store.palette_rgb,
-    store.matrix_axis_slice
+    store.matrix_axis_slice,
+    store.spatial_mix
   ].forEach((obs) => obs.subscribe(() => scheduleRender(), { immediate: false }));
   const syncFromModel = () => {
     const ci = JSON.stringify(model.get("click_info") || {});
@@ -45818,6 +45900,9 @@ function render({ model, el }) {
     store.width.set(model.get("width") || 560);
     store.height.set(model.get("height") || 800);
     store.debug.set(Boolean(model.get("debug")));
+    const mixVal = model.get("spatial_mix") || 0;
+    store.spatial_mix.set(mixVal);
+    slider.value = String(mixVal);
     log3(store, "syncFromModel done", {
       linkSeq: linkInteractionSeq,
       rows: (store.selected_rows.get() || []).length,
@@ -45839,7 +45924,8 @@ function render({ model, el }) {
     "height",
     "debug",
     "palette_rgb",
-    "matrix_axis_slice"
+    "matrix_axis_slice",
+    "spatial_mix"
   ].forEach((name2) => model.on(`change:${name2}`, syncFromModel));
   model.on("change:cg_row_names", () => scheduleRender());
   model.on("change:cg_col_names", () => scheduleRender());

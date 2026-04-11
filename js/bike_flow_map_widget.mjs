@@ -34,6 +34,8 @@ const createStore = () => ({
   deck_ready: Observable(false),
   palette_rgb: Observable([]),
   matrix_axis_slice: Observable({}),
+  spatial_mix: Observable(0),
+  hovered_cluster: Observable(null),
 });
 
 const log = (store, ...args) => {
@@ -110,13 +112,14 @@ const setDerivedState = (store, { focus, highlights, edges }) => {
   return changed;
 };
 
-function basemapLayer() {
+function basemapLayer(opacity = 255) {
   return new TileLayer({
     id: 'bike-basemap',
     data: 'https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
     minZoom: 0,
     maxZoom: 19,
     tileSize: 256,
+    opacity: opacity / 255,
     renderSubLayers: (props) => {
       if (!props.data || !props.tile) return null;
       let west;
@@ -240,7 +243,48 @@ function render({ model, el }) {
   root.style.background = '#e2e4e8';
   root.style.borderRadius = '4px';
   root.style.overflow = 'hidden';
+  root.style.position = 'relative';
   el.appendChild(root);
+
+  const controlPanel = document.createElement('div');
+  controlPanel.style.cssText =
+    'position:absolute;top:10px;right:10px;background:rgba(255,255,255,0.92);' +
+    'padding:8px 14px;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,0.15);' +
+    'z-index:1;font:12px system-ui,sans-serif;user-select:none;display:none;';
+  const sliderLabel = document.createElement('div');
+  sliderLabel.style.cssText = 'margin-bottom:4px;color:#444;font-weight:500;';
+  sliderLabel.textContent = 'Spatial \u2194 UMAP';
+  const slider = document.createElement('input');
+  slider.type = 'range';
+  slider.min = '0';
+  slider.max = '1';
+  slider.step = '0.01';
+  slider.value = '0';
+  slider.style.cssText = 'width:140px;cursor:pointer;';
+  slider.addEventListener('input', () => {
+    const t = parseFloat(slider.value);
+    store.spatial_mix.set(t);
+    model.set('spatial_mix', t);
+    model.save_changes();
+  });
+  controlPanel.appendChild(sliderLabel);
+  controlPanel.appendChild(slider);
+  for (const evt of ['pointerdown', 'pointermove', 'pointerup', 'wheel', 'dblclick']) {
+    controlPanel.addEventListener(evt, (e) => e.stopPropagation());
+  }
+  root.appendChild(controlPanel);
+
+  store.stations.subscribe((stations) => {
+    const hasUmap = stations.some((s) => s.umap_lng != null && s.umap_lat != null);
+    controlPanel.style.display = hasUmap ? 'block' : 'none';
+  }, { immediate: true });
+
+  root.addEventListener('mouseleave', () => {
+    if (store.hovered_cluster.get() != null) {
+      store.hovered_cluster.set(null);
+      scheduleRender();
+    }
+  });
 
   let deck = null;
   let raf = 0;
@@ -552,6 +596,30 @@ function render({ model, el }) {
       version: renderVersion,
     });
     const hasSel = Boolean(focus) || highlights.size > 0;
+    const spatialMix = store.spatial_mix.get();
+    const hoveredCluster = store.hovered_cluster.get();
+    const posLookup = {};
+    let geoSumLng = 0, geoSumLat = 0, umapSumLng = 0, umapSumLat = 0, umapN = 0;
+    for (const s of stations) {
+      geoSumLng += Number(s.lng); geoSumLat += Number(s.lat);
+      if (s.umap_lng != null && s.umap_lat != null) {
+        umapSumLng += Number(s.umap_lng); umapSumLat += Number(s.umap_lat); umapN += 1;
+      }
+    }
+    const n = stations.length || 1;
+    const geoCenterLng = geoSumLng / n, geoCenterLat = geoSumLat / n;
+    const umapCenterLng = umapN ? umapSumLng / umapN : geoCenterLng;
+    const umapCenterLat = umapN ? umapSumLat / umapN : geoCenterLat;
+    const dLng = geoCenterLng - umapCenterLng, dLat = geoCenterLat - umapCenterLat;
+    for (const s of stations) {
+      const t = spatialMix;
+      const hasUmap = s.umap_lng != null && s.umap_lat != null;
+      const uLng = hasUmap ? Number(s.umap_lng) + dLng : Number(s.lng);
+      const uLat = hasUmap ? Number(s.umap_lat) + dLat : Number(s.lat);
+      const lng = Number(s.lng) * (1 - t) + uLng * t;
+      const lat = Number(s.lat) * (1 - t) + uLat * t;
+      posLookup[s.name] = [lng, lat];
+    }
     const { out, inn } = getLinkedWeights();
     const highlightKey = Array.from(highlights).sort().join('|');
     const outKey = Array.from(out.entries())
@@ -562,7 +630,7 @@ function render({ model, el }) {
       .map(([k, v]) => `${k}:${v}`)
       .sort()
       .join('|');
-    const styleKey = `${focus}__${highlightKey}__${outKey}__${inKey}__${hasSel}`;
+    const styleKey = `${focus}__${highlightKey}__${outKey}__${inKey}__${hasSel}__${spatialMix}__${hoveredCluster}`;
 
     let peakLinkWeight = 0;
     for (const v of out.values()) peakLinkWeight = Math.max(peakLinkWeight, v);
@@ -595,7 +663,7 @@ function render({ model, el }) {
       radiusUnits: 'meters',
       radiusMinPixels: 3,
       radiusMaxPixels: 56,
-      getPosition: (d) => [Number(d.lng), Number(d.lat)],
+      getPosition: (d) => posLookup[d.name] || [Number(d.lng), Number(d.lat)],
       getRadius: (d) => {
         const n = d.name;
         if (focus && n === focus) return focusHubRadius();
@@ -619,17 +687,28 @@ function render({ model, el }) {
           }
           return TRAFFIC_UNCONNECTED_RGBA;
         }
-        // Dendrogram / matrix highlights (no focus): cluster colors from palette_rgb
         if (highlights.size > 0) {
           const c = clusterFillColor(d.cluster_id, palRgb);
           if (highlights.has(n)) return [c[0], c[1], c[2], 242];
           return [c[0], c[1], c[2], 36];
+        }
+        if (hoveredCluster != null) {
+          if (d.cluster_id === hoveredCluster) return clusterFillWithAlpha(d.cluster_id, 248, palRgb);
+          return clusterFillWithAlpha(d.cluster_id, 50, palRgb);
         }
         return clusterFillColor(d.cluster_id, palRgb);
       },
       updateTriggers: {
         getRadius: [styleKey, renderVersion],
         getFillColor: [styleKey, renderVersion],
+        getPosition: [spatialMix, renderVersion],
+      },
+      onHover: (info) => {
+        const cid = info.object ? info.object.cluster_id : null;
+        if (store.hovered_cluster.get() !== cid) {
+          store.hovered_cluster.set(cid);
+          scheduleRender();
+        }
       },
       onClick: (info) => {
         if (!info.object) return;
@@ -682,11 +761,13 @@ function render({ model, el }) {
       id: 'bike-flow-lines',
       data: edges,
       widthUnits: 'pixels',
-      getSourcePosition: (d) => d.source,
-      getTargetPosition: (d) => d.target,
+      getSourcePosition: (d) => posLookup[d.source_name] || d.source,
+      getTargetPosition: (d) => posLookup[d.target_name] || d.target,
       getWidth: lineWidthFor,
       updateTriggers: {
         getWidth: [styleKey, renderVersion],
+        getSourcePosition: [spatialMix, renderVersion],
+        getTargetPosition: [spatialMix, renderVersion],
       },
       getColor: (d) => {
         const a = Math.round(Math.max(0, Math.min(1, Number(d.opacity) || 0)) * 255);
@@ -696,7 +777,8 @@ function render({ model, el }) {
       },
     });
 
-    return [basemapLayer(), lines, points];
+    const basemapAlpha = Math.round(255 * (1 - spatialMix));
+    return [basemapLayer(basemapAlpha), lines, points];
   };
 
   let pendingProps = null;
@@ -713,15 +795,17 @@ function render({ model, el }) {
       parent: root,
       width: w,
       height: h,
-      controller: true,
+      controller: { doubleClickZoom: false },
       layers: buildLayers(),
       getTooltip: ({ object, layer }) => {
         if (!object || layer.id !== 'bike-stations') return null;
-        const sid = object.station_id != null ? String(object.station_id) : '';
         const nm = object.name != null ? String(object.name) : '';
-        const html = sid
-          ? `<div style="font:12px system-ui,sans-serif;"><b>id</b> ${sid}<br/><b>name</b> ${nm}</div>`
-          : `<div style="font:12px system-ui,sans-serif;">${nm}</div>`;
+        const cid = object.cluster_id != null ? String(object.cluster_id) : '';
+        const clusterLine =
+          cid && cid !== '0'
+            ? `<br/><span style="color:#666;">Cluster ${cid}</span>`
+            : '';
+        const html = `<div style="font:12px system-ui,sans-serif;"><b>${nm}</b>${clusterLine}</div>`;
         return {
           html,
           style: {
@@ -810,6 +894,7 @@ function render({ model, el }) {
     store.height,
     store.palette_rgb,
     store.matrix_axis_slice,
+    store.spatial_mix,
   ].forEach((obs) => obs.subscribe(() => scheduleRender(), { immediate: false }));
 
   const syncFromModel = () => {
@@ -831,6 +916,9 @@ function render({ model, el }) {
     store.width.set(model.get('width') || 560);
     store.height.set(model.get('height') || 800);
     store.debug.set(Boolean(model.get('debug')));
+    const mixVal = model.get('spatial_mix') || 0;
+    store.spatial_mix.set(mixVal);
+    slider.value = String(mixVal);
     log(store, 'syncFromModel done', {
       linkSeq: linkInteractionSeq,
       rows: (store.selected_rows.get() || []).length,
@@ -855,6 +943,7 @@ function render({ model, el }) {
     'debug',
     'palette_rgb',
     'matrix_axis_slice',
+    'spatial_mix',
   ].forEach((name) => model.on(`change:${name}`, syncFromModel));
 
   model.on('change:cg_row_names', () => scheduleRender());
