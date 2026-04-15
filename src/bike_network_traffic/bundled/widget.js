@@ -45334,11 +45334,13 @@ function render({ model, el }) {
     controlPanel.style.display = hasUmap ? "block" : "none";
   }, { immediate: true });
   root.addEventListener("mouseleave", () => {
+    clearTimeout(hoverTimer);
     if (store.hovered_cluster.get() != null) {
       store.hovered_cluster.set(null);
       scheduleRender();
     }
   });
+  let hoverTimer = 0;
   let deck = null;
   let raf = 0;
   let renderVersion = 0;
@@ -45709,6 +45711,10 @@ function render({ model, el }) {
         }
         return clusterFillColor(d2.cluster_id, palRgb);
       },
+      transitions: {
+        getFillColor: 400,
+        getRadius: 400
+      },
       updateTriggers: {
         getRadius: [styleKey, renderVersion],
         getFillColor: [styleKey, renderVersion],
@@ -45931,6 +45937,7 @@ function render({ model, el }) {
   model.on("change:cg_col_names", () => scheduleRender());
   syncFromModel();
   return () => {
+    clearTimeout(hoverTimer);
     if (raf) cancelAnimationFrame(raf);
     if (deck) deck.finalize();
   };
