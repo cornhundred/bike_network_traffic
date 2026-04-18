@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bike_network_traffic — bike-share network analysis with Celldega</title>
+<meta name="description" content="Linked deck.gl + Celldega clustergram visualizations of bike-share station-to-station traffic for NYC, Boston, DC, and Chicago.">
+
+<style>
+  :root {
+    --fg: #1c1f24;
+    --fg-muted: #5b6470;
+    --bg: #fafbfc;
+    --bg-card: #ffffff;
+    --border: #e3e6ea;
+    --accent: #0072B2;       /* Okabe-Ito blue, matches the widget palette */
+    --accent-hover: #005383;
+    --code-bg: #f1f3f5;
+    --shadow: 0 1px 2px rgba(15, 22, 36, 0.04), 0 4px 12px rgba(15, 22, 36, 0.04);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e8ecf1;
+      --fg-muted: #9aa3b1;
+      --bg: #14171c;
+      --bg-card: #1c2027;
+      --border: #2a2f38;
+      --accent: #56B4E9;
+      --accent-hover: #88c9ee;
+      --code-bg: #20242c;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 6px 18px rgba(0, 0, 0, 0.3);
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  main { max-width: 1300px; margin: 0 auto; padding: 48px 32px 96px; }
+  header { margin-bottom: 24px; }
+  h1 {
+    font-size: 2.25rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    margin: 0 0 8px;
+  }
+  .tagline { color: var(--fg-muted); margin: 0 0 24px; font-size: 1.125rem; }
+  h2 {
+    font-size: 1.4rem;
+    font-weight: 650;
+    letter-spacing: -0.01em;
+    margin: 56px 0 16px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+  }
+  p { margin: 0 0 14px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { color: var(--accent-hover); text-decoration: underline; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas, monospace;
+    background: var(--code-bg);
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-size: 0.92em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas, monospace;
+    font-size: 0.88rem;
+    line-height: 1.5;
+    margin: 14px 0 18px;
+  }
+
+  .pill-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0 8px; }
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    font-size: 0.82rem;
+    color: var(--fg-muted);
+    background: var(--bg-card);
+  }
+
+  .embed {
+    margin: 24px 0 8px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--bg-card);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+  .embed-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.88rem;
+    color: var(--fg-muted);
+    background: linear-gradient(180deg, transparent, rgba(0,0,0,0.015));
+  }
+  .embed-bar strong { color: var(--fg); font-weight: 600; }
+  .embed-bar label { color: var(--fg-muted); margin-right: 8px; }
+  .embed-bar select {
+    font: inherit;
+    padding: 5px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg-card);
+    color: var(--fg);
+    cursor: pointer;
+  }
+  .embed-bar select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .embed-bar .openlink { white-space: nowrap; }
+  .embed iframe {
+    display: block;
+    width: 100%;
+    height: 760px;
+    border: 0;
+    background: var(--bg-card);
+  }
+
+  .city-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 16px;
+    margin: 24px 0 8px;
+  }
+  .city-card {
+    display: block;
+    padding: 18px 20px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--bg-card);
+    color: inherit;
+    text-decoration: none;
+    transition: transform 120ms ease, box-shadow 120ms ease, border-color 120ms ease;
+  }
+  .city-card:hover {
+    text-decoration: none;
+    transform: translateY(-2px);
+    border-color: var(--accent);
+    box-shadow: var(--shadow);
+  }
+  .city-card .swatch {
+    display: inline-block;
+    width: 12px; height: 12px;
+    border-radius: 3px;
+    margin-right: 8px;
+    vertical-align: middle;
+  }
+  .city-card .name { font-weight: 650; font-size: 1.05rem; letter-spacing: -0.005em; }
+  .city-card .system { color: var(--fg-muted); font-size: 0.9rem; margin-top: 4px; }
+  .city-card .meta { color: var(--fg-muted); font-size: 0.8rem; margin-top: 10px; }
+
+  footer {
+    margin-top: 64px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+    color: var(--fg-muted);
+    font-size: 0.88rem;
+  }
+</style>
+</head>
+
+<body>
+<main>
+
+<header>
+  <h1>bike_network_traffic</h1>
+  <p class="tagline">
+    Linked <a href="https://deck.gl/">deck.gl</a> +
+    <a href="https://github.com/broadinstitute/celldega">Celldega</a> visualizations of bike-share
+    station-to-station traffic.
+  </p>
+  <div class="pill-row">
+    <span class="pill">Python · Jupyter · anywidget</span>
+    <span class="pill">deck.gl · WebGL</span>
+    <span class="pill">Celldega clustergram</span>
+    <span class="pill">UMAP</span>
+  </div>
+</header>
+
+<section>
+  <h2>What is this?</h2>
+  <p>
+    Each public bike-share program in the US (Citi Bike NYC, Bluebikes Boston, Capital
+    Bikeshare DC, Divvy Chicago) publishes monthly trip CSVs to a public S3 bucket. This
+    project turns one month of trips into a <em>destination-probability matrix</em> — for
+    every origin station, the probability distribution over its destinations — and visualizes
+    it as a Celldega clustergram linked to a deck.gl map of the stations.
+  </p>
+  <p>
+    The two views are <strong>bidirectionally linked in the browser</strong>: hovering or
+    selecting on the heatmap highlights the corresponding stations on the map; clicking or
+    box-selecting on the map slices the matrix. A slider morphs the map between geographic
+    coordinates and a UMAP embedding of the transition matrix, so behavioral neighborhoods
+    (commute corridors, leisure routes) emerge from the geographic backdrop.
+  </p>
+</section>
+
+<section>
+  <h2>Live, in your browser</h2>
+  <p>
+    Pick a city. The widget below is the linked deck.gl map + Celldega Clustergram, with no
+    kernel attached — all interactions (hover, click, slice, the spatial-vs-UMAP slider) run
+    purely in the browser via <code>jsdlink</code>.
+  </p>
+  <div class="embed">
+    <div class="embed-bar">
+      <span>
+        <label for="city-select">City:</label>
+        <select id="city-select" aria-label="Choose a city to display">
+          <option value="NYC_widget.html"     data-system="Citi Bike (NYC)"           data-full="NYC.html">New York — Citi Bike</option>
+          <option value="Boston_widget.html"  data-system="Bluebikes (Boston)"        data-full="Boston.html">Boston — Bluebikes</option>
+          <option value="DC_widget.html"      data-system="Capital Bikeshare (DC)"    data-full="DC.html">Washington, DC — Capital Bikeshare</option>
+          <option value="Chicago_widget.html" data-system="Divvy (Chicago)"           data-full="Chicago.html">Chicago — Divvy</option>
+        </select>
+      </span>
+      <span class="openlink">
+        <a id="open-widget" href="NYC_widget.html" target="_blank" rel="noopener">open standalone ↗</a>
+        &nbsp;·&nbsp;
+        <a id="open-notebook" href="NYC.html" target="_blank" rel="noopener">view full notebook ↗</a>
+      </span>
+    </div>
+    <iframe id="city-frame" src="NYC_widget.html"
+            title="Bike network traffic visualization"
+            loading="lazy" allow="fullscreen"></iframe>
+  </div>
+  <p style="font-size: 0.88rem; color: var(--fg-muted); margin-top: 10px;">
+    The dropdown swaps between the four cities. Each option loads a self-contained
+    HTML built by <code>build_widget_htmls.ipynb</code> via
+    <code>save_minimal_html(HBox([flow, cgm]), …)</code>.
+  </p>
+</section>
+
+<script>
+  (function () {
+    var sel = document.getElementById('city-select');
+    var frame = document.getElementById('city-frame');
+    var openWidget = document.getElementById('open-widget');
+    var openNotebook = document.getElementById('open-notebook');
+    sel.addEventListener('change', function () {
+      var opt = sel.options[sel.selectedIndex];
+      frame.src = opt.value;
+      openWidget.href = opt.value;
+      openNotebook.href = opt.dataset.full;
+    });
+  })();
+</script>
+
+<section>
+  <h2>All four cities</h2>
+  <div class="city-grid">
+    <a class="city-card" href="NYC.html">
+      <div><span class="swatch" style="background:#0072B2"></span><span class="name">New York</span></div>
+      <div class="system">Citi Bike</div>
+      <div class="meta">~2,000 stations · March 2026</div>
+    </a>
+    <a class="city-card" href="Boston.html">
+      <div><span class="swatch" style="background:#009E73"></span><span class="name">Boston</span></div>
+      <div class="system">Bluebikes</div>
+      <div class="meta">~500 stations · March 2026</div>
+    </a>
+    <a class="city-card" href="DC.html">
+      <div><span class="swatch" style="background:#D55E00"></span><span class="name">Washington, DC</span></div>
+      <div class="system">Capital Bikeshare</div>
+      <div class="meta">~700 stations · March 2026</div>
+    </a>
+    <a class="city-card" href="Chicago.html">
+      <div><span class="swatch" style="background:#E69F00"></span><span class="name">Chicago</span></div>
+      <div class="system">Divvy</div>
+      <div class="meta">~1,000 stations · 2026 YTD</div>
+    </a>
+  </div>
+</section>
+
+<section>
+  <h2>How the API works</h2>
+  <p>
+    The Python package fetches data straight from each city's S3 bucket and returns
+    Celldega-ready DataFrames. A whole notebook is now four lines of setup:
+  </p>
+<pre>from bike_network_traffic import (
+    get_bike_data, make_station_clustergram, make_flow_widget, link_flow_to_clustergram,
+)
+from ipywidgets import HBox
+
+stations, transition_prob = get_bike_data("nyc", year=2026, month=3)
+mat, cgm, cluster_map = make_station_clustergram(transition_prob, n_clusters=150)
+flow = make_flow_widget(stations, transition_prob, cluster_map)
+link_flow_to_clustergram(flow, cgm)
+HBox([flow, cgm])</pre>
+  <p>
+    <code>get_bike_data</code> handles the S3 listing, monthly archive download, on-disk
+    cache (<code>~/.cache/bike_network_traffic/</code>), zip extraction, schema
+    normalization (modern + legacy column names), and the destination-probability matrix
+    construction. Single month, list of months, or a whole year all work:
+  </p>
+<pre>get_bike_data("nyc",     year=2026, month=3)        # one month
+get_bike_data("boston",  year=2025, month=[6, 7, 8]) # three months
+get_bike_data("chicago", year=2025)                  # whole year</pre>
+</section>
+
+<section>
+  <h2>Get it running locally</h2>
+<pre>git clone https://github.com/broadinstitute/celldega.git
+cd celldega/...
+
+uv venv --python 3.11
+source .venv/bin/activate
+uv pip install -e ".[notebooks]"
+
+jupyter lab</pre>
+  <p>Open <code>NYC.ipynb</code> (or any of the four city notebooks) and run all cells.</p>
+</section>
+
+<footer>
+  <p>
+    Built on <a href="https://anywidget.dev/">anywidget</a>,
+    <a href="https://deck.gl/">deck.gl</a>, and
+    <a href="https://github.com/broadinstitute/celldega">Celldega</a>.
+    Trip data published by
+    <a href="https://citibikenyc.com/system-data">Citi Bike</a>,
+    <a href="https://bluebikes.com/system-data">Bluebikes</a>,
+    <a href="https://capitalbikeshare.com/system-data">Capital Bikeshare</a>, and
+    <a href="https://divvybikes.com/system-data">Divvy</a>.
+    &nbsp;·&nbsp;
+    <a href="https://github.com/broadinstitute/celldega/tree/bikes/notebooks">Source</a>
+  </p>
+</footer>
+
+</main>
+</body>
+</html>
