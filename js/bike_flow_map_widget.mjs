@@ -37,6 +37,17 @@ const createStore = () => ({
   focus: Observable(''),
   highlights: Observable([]),
   edges: Observable([]),
+  // What *kind* of selection produced the current focus/highlights/edges.
+  // Drives the rides simulator's focused-mode behaviour:
+  //   null            — no selection, full ambient walk
+  //   'station'       — a single station was clicked (map or row/col label)
+  //   'mat_cell'      — a single matrix cell click (one origin → one dest)
+  //   'col_dendro'    — selected origins (outgoing rides only)
+  //   'row_dendro'    — selected destinations (incoming rides only)
+  //   'cat_value'     — manual category selection (treated like col_dendro
+  //                      since the natural interpretation is "rides
+  //                      starting from any of these stations")
+  selection_kind: Observable(null),
   deck_check: Observable({ inputs: true, computed: true, layers: true }),
   deck_ready: Observable(false),
   palette_rgb: Observable([]),
@@ -57,14 +68,30 @@ const createStore = () => ({
   // changing the semantic state of the map.
   station_size_mult: Observable(1.0),
   nbhd_opacity_mult: Observable(0.4),
+  // Animated bike-ride simulation. transition_topk is a sparse top-K
+  // destination distribution per origin (shipped from Python);
+  // station_outflow holds raw per-station outflow counts (also from
+  // Python, when raw trips are available) used to weight initial bike
+  // placements and rebalancing teleports by true trip volume;
+  // show_rides toggles the layer; current_time is the wall-clock used
+  // by the random walker (it advances every animation frame while
+  // rides are visible).
+  transition_topk: Observable({}),
+  station_outflow: Observable({}),
+  show_rides: Observable(true),
+  current_time: Observable(0),
 });
 
 const log = (store, ...args) => {
   if (store.debug.get()) console.log('[bike-map]', ...args);
 };
 
-/** Map station click: keep top-K neighbors per direction (row + col slices) for readability. */
-const MAP_STATION_SLICE_TOP_K = 25;
+// Map station click: how many neighbors per direction (row + col slices)
+// to ask the Clustergram for. The simulated rides carry the long-tail
+// signal visually, so the lines themselves stay focused on the dominant
+// flows — top-30 keeps the geometry readable instead of devolving into
+// spaghetti when a Manhattan hub has hundreds of non-trivial neighbors.
+const MAP_STATION_SLICE_TOP_K = 30;
 
 /**
  * Ask the Clustergram for a normal row-axis + col-axis slice (same station on both axes).
@@ -106,14 +133,20 @@ const sameList = (a, b) => {
   return true;
 };
 
-const setDerivedState = (store, { focus, highlights, edges }) => {
+const setDerivedState = (store, { focus, highlights, edges, kind }) => {
   const curFocus = store.focus.get() || '';
   const curHighlights = store.highlights.get() || [];
   const curEdges = store.edges.get() || [];
+  const curKind = store.selection_kind.get() || null;
 
   const nextFocus = focus || '';
   const nextHighlights = highlights || [];
   const nextEdges = edges || [];
+  // Allow explicit kind=null to mean "clear", and undefined to mean
+  // "infer". Inference: focus → 'station', else null. mat_cell and
+  // dendro modes always pass kind explicitly.
+  const inferredKind = nextFocus ? 'station' : null;
+  const nextKind = kind === undefined ? inferredKind : kind;
 
   let changed = false;
   if (curFocus !== nextFocus) {
@@ -128,6 +161,10 @@ const setDerivedState = (store, { focus, highlights, edges }) => {
   const nextStr = JSON.stringify(nextEdges);
   if (curStr !== nextStr) {
     store.edges.set(nextEdges);
+    changed = true;
+  }
+  if (curKind !== nextKind) {
+    store.selection_kind.set(nextKind);
     changed = true;
   }
   return changed;
@@ -242,6 +279,544 @@ function flowBlendWithAlpha(outW, inW, alpha) {
   return [r, g, b, alpha];
 }
 
+// ---------- Ride simulator ----------------------------------------------
+// Animates ~1000 bike rides on the map as a brownian-style random walk
+// over the transition graph: each ride remembers its current station and
+// hops to a new one drawn from that station's top-K destination
+// distribution. When it arrives, it samples again from the new station's
+// distribution — the rides effectively trace markov-chain trajectories
+// of the empirical bike-flow process. The whole thing is front-end
+// driven; Python only ships the sparse top-K table once at widget
+// creation so this works in fully static HTML embeds.
+
+// The ride pool sizes itself per city: ~2 walkers per station, clamped
+// to a comfortable range. NYC's ~2000 stations -> ~4000 rides; Boston's
+// ~400 -> ~800; DC ~700 -> ~1400; Chicago ~900 -> ~1800. The cap keeps
+// the per-frame interpolation loop under a few ms even on dense
+// systems, while the floor guarantees a visible swarm in small cities.
+const RIDES_PER_STATION = 2.0;
+const RIDES_POOL_MIN = 400;
+const RIDES_POOL_MAX = 5000;
+// When the user selects a station / row / column / cell we shrink the
+// pool to ~10% of the ambient size — the simulation is now restricted
+// to one station's neighbourhood (or one direction, or one cell), so
+// the same ride density would actually obscure the geometry. A small
+// floor keeps a focused selection on a tiny city visibly animated.
+const RIDES_FOCUSED_FRACTION = 0.10;
+const RIDES_FOCUSED_MIN = 50;
+function targetRidesPoolSize(numStations, focused = false) {
+  const n = Math.round(Number(numStations) || 0);
+  const ambient = Math.max(
+    RIDES_POOL_MIN,
+    Math.min(RIDES_POOL_MAX, Math.round(n * RIDES_PER_STATION) || RIDES_POOL_MIN),
+  );
+  if (!focused) return ambient;
+  return Math.max(RIDES_FOCUSED_MIN, Math.round(ambient * RIDES_FOCUSED_FRACTION));
+}
+// Per-segment timing. We use a *constant velocity* model: every ride
+// covers the same number of degrees per millisecond on screen, so a
+// short hop finishes quickly and a cross-town hop takes proportionally
+// longer. This keeps the visible flow speed consistent regardless of
+// segment length — without it, short hops crawl (because the duration
+// has a base cost) while long hops streak. RIDE_MS_PER_DEG sets that
+// constant velocity (~35 s/deg → a typical 0.07° NYC hop takes ~2.5 s).
+// A small jitter on the *velocity* keeps dots from arriving in lockstep
+// without breaking the constant-speed visual.
+const RIDE_MS_PER_DEG = 180000;
+const RIDE_SEG_VEL_JITTER = 0.18;
+const RIDE_SEG_MIN_MS = 250;
+// Initial scatter: when the pool is first seeded (or fully flushed on
+// focus change) we randomize each ride's progress so the dots don't all
+// depart together — they immediately appear as a steady-state flow.
+const RIDE_INITIAL_T_SCATTER = true;
+// PageRank-style teleport that mimics how bike-share organizations
+// physically rebalance bikes back to high-traffic stations. Without it,
+// walkers can spend many steps shuffling between a handful of nearby
+// outer-borough stations because `transition_prob` is column-normalized
+// and loses absolute trip volume. With probability RIDE_TELEPORT_PROB
+// per step a walker instead jumps to a station drawn from the chain's
+// stationary distribution (computed by power iteration below), which is
+// concentrated on busy hubs — so the swarm continually rebalances back
+// to high-density areas, exactly like a redistribution truck would.
+const RIDE_TELEPORT_PROB = 0.05;
+// Power-iteration parameters for the stationary distribution. 30 steps
+// is comfortably enough for a 2k-station chain to converge given the
+// fast mixing induced by the teleport above; cost is one-time at
+// sampler creation (~5 ms for NYC).
+const RIDE_STATIONARY_ITERS = 30;
+
+/**
+ * Build a sampler over a {origin: [[dest, weight], ...]} top-K table.
+ *
+ * Returns:
+ *   { origins, sample(currentName?) } where:
+ *     - origins: array of valid origin station names (those with a
+ *       non-empty outgoing distribution)
+ *     - sample(currentName): returns the next destination name based on
+ *       the markov kernel rooted at `currentName`. Falls back to a
+ *       uniform pick over `origins` when `currentName` is not in the
+ *       table or has no outgoing mass.
+ *
+ * Self-transitions are filtered out at sample time so each step always
+ * makes geographic progress.
+ */
+function makeRideSampler(transitionTopk, stationOutflow) {
+  const origins = [];
+  const cdfByOrigin = new Map();
+  for (const [origin, entries] of Object.entries(transitionTopk || {})) {
+    if (!Array.isArray(entries) || entries.length === 0) continue;
+    let total = 0;
+    const dests = new Array(entries.length);
+    const cum = new Float64Array(entries.length);
+    for (let i = 0; i < entries.length; i += 1) {
+      const e = entries[i];
+      const w = Math.max(0, Number(e?.[1]) || 0);
+      total += w;
+      dests[i] = String(e?.[0] || '');
+      cum[i] = total;
+    }
+    if (total <= 0) continue;
+    origins.push(origin);
+    cdfByOrigin.set(origin, { dests, cum, total });
+  }
+  // ---- Volume distribution for initial seed + teleport --------------
+  // Two ways to estimate "where bikes are" / "where rides start":
+  //   1. Raw outflow counts (preferred): the Python side computed real
+  //      per-station trip counts from the trips DataFrame and shipped
+  //      them via station_outflow. These are the ground truth.
+  //   2. Stationary distribution (fallback): when raw trips weren't
+  //      available we approximate by power-iterating the markov chain
+  //      defined by the top-K kernel; the result is concentrated on the
+  //      same hubs but slightly biased by the topk truncation.
+  // Either way we end up with a non-negative weight per origin station,
+  // which we then turn into a teleport CDF. The initial seed uses the
+  // same CDF (via pickInitial) so initial bikes-per-station tracks
+  // either true outflow or its best approximation.
+  const N = origins.length;
+  const weights = new Float64Array(N);
+  const useRawOutflow =
+    stationOutflow
+    && typeof stationOutflow === 'object'
+    && Object.keys(stationOutflow).length > 0;
+  if (useRawOutflow) {
+    for (let i = 0; i < N; i += 1) {
+      const w = Number(stationOutflow[origins[i]]) || 0;
+      weights[i] = w > 0 ? w : 0;
+    }
+  } else {
+    // Power iteration over the sparse top-K kernel. π = P · π.
+    const idxByName = new Map();
+    for (let i = 0; i < N; i += 1) idxByName.set(origins[i], i);
+    let pi = new Float64Array(N);
+    if (N > 0) pi.fill(1 / N);
+    for (let iter = 0; iter < RIDE_STATIONARY_ITERS && N > 0; iter += 1) {
+      const next = new Float64Array(N);
+      for (let oi = 0; oi < N; oi += 1) {
+        const massHere = pi[oi];
+        if (massHere <= 0) continue;
+        const entry = cdfByOrigin.get(origins[oi]);
+        if (!entry) continue;
+        const { dests, cum, total } = entry;
+        let prevCum = 0;
+        for (let kk = 0; kk < dests.length; kk += 1) {
+          const w = (cum[kk] - prevCum) / total;
+          prevCum = cum[kk];
+          const di = idxByName.get(dests[kk]);
+          if (di != null) next[di] += w * massHere;
+        }
+      }
+      let sum = 0;
+      for (let i = 0; i < N; i += 1) sum += next[i];
+      if (sum <= 0) break;
+      for (let i = 0; i < N; i += 1) pi[i] = next[i] / sum;
+    }
+    for (let i = 0; i < N; i += 1) weights[i] = pi[i];
+  }
+  // Build the teleport CDF from `weights`. Only keep stations that also
+  // have an outgoing entry, so teleport always lands somewhere with
+  // onward edges (avoids visual stalls).
+  const teleportNames = [];
+  let teleportTotal = 0;
+  const teleportCum = [];
+  for (let i = 0; i < N; i += 1) {
+    const w = weights[i];
+    if (w <= 0) continue;
+    teleportTotal += w;
+    teleportNames.push(origins[i]);
+    teleportCum.push(teleportTotal);
+  }
+  const pickFromCum = (names, cum, total, exclude) => {
+    if (!names.length || total <= 0) return null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const u = Math.random() * total;
+      let pick = names[names.length - 1];
+      for (let i = 0; i < cum.length; i += 1) {
+        if (u < cum[i]) {
+          pick = names[i];
+          break;
+        }
+      }
+      if (pick !== exclude) return pick;
+    }
+    return names[0] !== exclude ? names[0] : (names[1] || names[0]);
+  };
+  const pickFrom = (entry, exclude) => {
+    if (!entry) return null;
+    return pickFromCum(entry.dests, entry.cum, entry.total, exclude);
+  };
+  const teleport = (exclude) => pickFromCum(teleportNames, teleportCum, teleportTotal, exclude);
+  return {
+    origins,
+    /** Teleport-weighted initial pick — used to seed the pool. */
+    pickInitial() {
+      if (teleportTotal > 0) return teleport(null);
+      if (origins.length === 0) return null;
+      return origins[(Math.random() * origins.length) | 0];
+    },
+    /**
+     * One markov step from `currentName`. With probability
+     * RIDE_TELEPORT_PROB we ignore the local distribution and teleport
+     * to an inflow-weighted random destination — this keeps the walk
+     * from collapsing into low-volume cycles in the outer boroughs.
+     */
+    sampleNext(currentName) {
+      if (origins.length === 0) return null;
+      if (Math.random() < RIDE_TELEPORT_PROB) {
+        const t = teleport(currentName);
+        if (t) return t;
+      }
+      const entry = cdfByOrigin.get(currentName);
+      if (entry) return pickFrom(entry, currentName);
+      // Unknown / no outgoing distribution — fall back to teleport so
+      // the ride doesn't get stuck.
+      return teleport(currentName)
+        || origins[(Math.random() * origins.length) | 0];
+    },
+  };
+}
+
+/**
+ * Compute a per-segment duration that scales with hop distance so long
+ * trips visibly take longer than short ones. Pure euclidean degrees is
+ * fine here — we only need rough proportionality, and at any single
+ * city's latitude the lng/lat distortion is roughly constant.
+ */
+function rideSegmentDuration(fromPos, toPos) {
+  const dlng = (toPos[0] - fromPos[0]);
+  const dlat = (toPos[1] - fromPos[1]);
+  const dist = Math.sqrt(dlng * dlng + dlat * dlat);
+  // Constant-velocity duration: dist * MS_PER_DEG, with a small
+  // multiplicative jitter on velocity so dots in the same wave don't
+  // arrive in lockstep. RIDE_SEG_MIN_MS guards against zero-length
+  // segments (co-located stations) becoming instantaneous.
+  const jitter = 1 + (Math.random() - 0.5) * 2 * RIDE_SEG_VEL_JITTER;
+  return Math.max(RIDE_SEG_MIN_MS, dist * RIDE_MS_PER_DEG * jitter);
+}
+
+function pickFromCdfArr(names, cum, total) {
+  if (!names.length || total <= 0) return null;
+  const u = Math.random() * total;
+  for (let i = 0; i < cum.length; i += 1) {
+    if (u < cum[i]) return names[i];
+  }
+  return names[names.length - 1];
+}
+
+/**
+ * Build a one-shot CDF over a list of station names with arbitrary
+ * weights, dropping anything without a valid position. Returns null
+ * when nothing usable remains.
+ */
+function buildWeightedCdf(weighted, posLookup) {
+  const names = []; const cum = []; let total = 0;
+  for (const [name, weight] of weighted) {
+    if (!name || !posLookup[name]) continue;
+    const w = Math.max(0, Number(weight) || 0);
+    if (w <= 0) continue;
+    total += w;
+    names.push(name);
+    cum.push(total);
+  }
+  if (total <= 0) return null;
+  return { names, cum, total };
+}
+
+/**
+ * Build a "focused mode" sampling context that the rides simulator uses
+ * in place of the ambient Markov walk. Five shapes, all returning the
+ * same { mode, ... } envelope so `spawnFocusedRide` can dispatch:
+ *
+ *   - 'station'    a single clicked station; in/out CDFs from
+ *                  store.edges (which the link layer is also drawing)
+ *   - 'mat_cell'   a single matrix cell click; every ride is the same
+ *                  fixed (from -> to) trip
+ *   - 'col_dendro' selected origins; rides start at one of them
+ *                  (weighted by station_outflow when available, else
+ *                  uniform) and visit a destination drawn from that
+ *                  origin's top-K kernel
+ *   - 'row_dendro' selected destinations; for each destination we
+ *                  invert transition_topk to build an incoming CDF
+ *                  over origins, then pick a destination (weighted by
+ *                  total inflow into the selection) and an origin
+ *                  from that destination's incoming CDF
+ *   - 'cat_value'  manual category — same as 'col_dendro'
+ *
+ * Returns null when no usable rides can be generated (no positions,
+ * empty distributions, ...).
+ */
+function buildFocusedRideContext({
+  kind,
+  focus,
+  highlights,
+  edges,
+  transitionTopk,
+  stationOutflow,
+  posLookup,
+}) {
+  const has = (n) => Boolean(n) && Boolean(posLookup[n]);
+
+  if (kind === 'station') {
+    if (!has(focus)) return null;
+    const outPairs = [];
+    const inPairs = [];
+    for (const e of edges || []) {
+      const w = Math.max(0, Number(e?.weight) || 0);
+      if (w <= 0) continue;
+      if (e.direction === 'out' && e.source_name === focus && has(e.target_name)) {
+        outPairs.push([e.target_name, w]);
+      } else if (e.direction === 'in' && e.target_name === focus && has(e.source_name)) {
+        inPairs.push([e.source_name, w]);
+      }
+    }
+    const out = buildWeightedCdf(outPairs, posLookup);
+    const inn = buildWeightedCdf(inPairs, posLookup);
+    if (!out && !inn) return null;
+    return { mode: 'station', focus, out, inn };
+  }
+
+  if (kind === 'mat_cell') {
+    // store.edges has the single 'direct' edge.
+    const e = (edges || []).find((x) => x && x.direction === 'direct');
+    if (!e || !has(e.source_name) || !has(e.target_name)) return null;
+    return { mode: 'mat_cell', from: e.source_name, to: e.target_name };
+  }
+
+  if (kind === 'col_dendro' || kind === 'cat_value') {
+    // Outgoing rides from any station in the selection. Origin weight
+    // = real outflow (when shipped) so busy origins fire proportionally.
+    const sel = (highlights || []).filter(has);
+    if (sel.length === 0) return null;
+    const useOutflow = stationOutflow && Object.keys(stationOutflow).length > 0;
+    const originPairs = sel.map((n) => [n, useOutflow ? (Number(stationOutflow[n]) || 1) : 1]);
+    const origin = buildWeightedCdf(originPairs, posLookup);
+    if (!origin) return null;
+    // Per-origin destination CDF straight from transition_topk (already
+    // top-K with weights). Built once at context-construction so spawn
+    // is a single CDF lookup per ride.
+    const destByOrigin = new Map();
+    for (const o of sel) {
+      const entries = (transitionTopk || {})[o];
+      if (!Array.isArray(entries) || entries.length === 0) continue;
+      const cdf = buildWeightedCdf(
+        entries
+          .filter((row) => row && row[0] !== o) // strip self-loops
+          .map((row) => [String(row[0]), Number(row[1]) || 0]),
+        posLookup,
+      );
+      if (cdf) destByOrigin.set(o, cdf);
+    }
+    if (destByOrigin.size === 0) return null;
+    return { mode: 'col_dendro', origin, destByOrigin };
+  }
+
+  if (kind === 'row_dendro') {
+    // Incoming rides to any station in the selection. transition_topk
+    // is keyed by origin -> top-K destinations; invert it once over the
+    // *selected* destinations to build an incoming CDF per destination.
+    const sel = (highlights || []).filter(has);
+    if (sel.length === 0) return null;
+    const selSet = new Set(sel);
+    const inflowByDest = new Map(); // dest -> array of [origin, weight]
+    for (const d of sel) inflowByDest.set(d, []);
+    for (const [origin, entries] of Object.entries(transitionTopk || {})) {
+      if (!Array.isArray(entries) || entries.length === 0) continue;
+      if (!has(origin)) continue;
+      for (const row of entries) {
+        const dest = String(row?.[0] || '');
+        if (!selSet.has(dest) || dest === origin) continue;
+        const w = Number(row?.[1]) || 0;
+        if (w <= 0) continue;
+        inflowByDest.get(dest).push([origin, w]);
+      }
+    }
+    const originByDest = new Map();
+    const destPairs = [];
+    for (const d of sel) {
+      const cdf = buildWeightedCdf(inflowByDest.get(d) || [], posLookup);
+      if (!cdf) continue;
+      originByDest.set(d, cdf);
+      destPairs.push([d, cdf.total]);
+    }
+    if (destPairs.length === 0) return null;
+    const dest = buildWeightedCdf(destPairs, posLookup);
+    if (!dest) return null;
+    return { mode: 'row_dendro', dest, originByDest };
+  }
+
+  return null;
+}
+
+/**
+ * One-shot ride for focused mode. Dispatches on focusCtx.mode (see
+ * buildFocusedRideContext). The returned ride is marked
+ * `focused: true` so `advanceRides` retires it on segment completion
+ * instead of taking another Markov step.
+ */
+function spawnFocusedRide(focusCtx, posLookup, paletteRgb, stationCluster) {
+  let from = null; let to = null;
+
+  if (focusCtx.mode === 'station') {
+    const { focus, out, inn } = focusCtx;
+    const outTotal = out ? out.total : 0;
+    const inTotal = inn ? inn.total : 0;
+    const total = outTotal + inTotal;
+    if (total <= 0) return null;
+    const goingOut = (Math.random() * total) < outTotal;
+    if (goingOut && out) {
+      from = focus;
+      to = pickFromCdfArr(out.names, out.cum, out.total);
+    } else if (inn) {
+      from = pickFromCdfArr(inn.names, inn.cum, inn.total);
+      to = focus;
+    }
+  } else if (focusCtx.mode === 'mat_cell') {
+    from = focusCtx.from;
+    to = focusCtx.to;
+  } else if (focusCtx.mode === 'col_dendro') {
+    const o = pickFromCdfArr(focusCtx.origin.names, focusCtx.origin.cum, focusCtx.origin.total);
+    if (!o) return null;
+    const cdf = focusCtx.destByOrigin.get(o);
+    if (!cdf) return null;
+    from = o;
+    to = pickFromCdfArr(cdf.names, cdf.cum, cdf.total);
+  } else if (focusCtx.mode === 'row_dendro') {
+    const d = pickFromCdfArr(focusCtx.dest.names, focusCtx.dest.cum, focusCtx.dest.total);
+    if (!d) return null;
+    const cdf = focusCtx.originByDest.get(d);
+    if (!cdf) return null;
+    from = pickFromCdfArr(cdf.names, cdf.cum, cdf.total);
+    to = d;
+  }
+
+  if (!from || !to || !posLookup[from] || !posLookup[to]) return null;
+  const cid = stationCluster?.get(from);
+  return {
+    from_name: from,
+    to_name: to,
+    t: RIDE_INITIAL_T_SCATTER ? Math.random() : 0,
+    duration: rideSegmentDuration(posLookup[from], posLookup[to]),
+    color: clusterRgbFromId(cid != null ? cid : 0, paletteRgb),
+    position: [posLookup[from][0], posLookup[from][1]],
+    focused: true,
+  };
+}
+
+/** Build a fresh ride from scratch, optionally rooted at `seedName`. */
+function spawnRide(sampler, seedName, posLookup, paletteRgb, stationCluster) {
+  const start = (seedName && posLookup[seedName]) ? seedName : sampler.pickInitial();
+  if (!start) return null;
+  const next = sampler.sampleNext(start);
+  if (!next || !posLookup[start] || !posLookup[next]) return null;
+  const cid = stationCluster?.get(start);
+  return {
+    from_name: start,
+    to_name: next,
+    // `t` is the progress along the current segment in [0, 1]. We
+    // scatter the initial value so 1000 rides appear as a steady stream
+    // rather than all departing in lockstep.
+    t: RIDE_INITIAL_T_SCATTER ? Math.random() : 0,
+    duration: rideSegmentDuration(posLookup[start], posLookup[next]),
+    color: clusterRgbFromId(cid != null ? cid : 0, paletteRgb),
+    // Live position; recomputed each frame from posLookup so rides morph
+    // alongside stations when the Spatial↔UMAP slider moves.
+    position: [posLookup[start][0], posLookup[start][1]],
+  };
+}
+
+/**
+ * Advance every ride by `dtMs`. When a ride completes its segment
+ * (t >= 1), it takes a markov step: the destination becomes its new
+ * "from" station and a fresh next station is sampled from there.
+ *
+ * Mutates rides in place; positions are recomputed by linear
+ * interpolation in the *current* posLookup so rides ride along with
+ * the spatial morph.
+ */
+function advanceRides(pool, dtMs, sampler, posLookup, paletteRgb, stationCluster, focusCtx) {
+  for (let i = 0; i < pool.length; i += 1) {
+    const r = pool[i];
+    if (!r) continue;
+    const fromPos = posLookup[r.from_name];
+    let toPos = posLookup[r.to_name];
+    if (!fromPos || !toPos) {
+      // Endpoint went missing (data swap mid-flight) — drop and let
+      // refillRides respawn appropriately for the current mode.
+      pool[i] = null;
+      continue;
+    }
+    r.t += dtMs / Math.max(50, r.duration);
+    if (r.t >= 1) {
+      if (r.focused) {
+        // Focused mode: a one-shot trip to/from the focused station. We
+        // do NOT continue the chain — the dot completes its segment
+        // and disappears. refillRides will spawn a replacement which
+        // again starts or ends at the current focus.
+        pool[i] = null;
+        continue;
+      }
+      while (r.t >= 1) {
+        // Ambient Markov step: arrived at `to_name`; pick next dest.
+        const overshoot = r.t - 1;
+        r.from_name = r.to_name;
+        const nextName = sampler.sampleNext(r.from_name) || sampler.pickInitial();
+        if (!nextName || !posLookup[nextName]) {
+          pool[i] = null;
+          break;
+        }
+        r.to_name = nextName;
+        const newFrom = posLookup[r.from_name];
+        const newTo = posLookup[r.to_name];
+        r.duration = rideSegmentDuration(newFrom, newTo);
+        const cid = stationCluster?.get(r.from_name);
+        r.color = clusterRgbFromId(cid != null ? cid : 0, paletteRgb);
+        r.t = overshoot;
+      }
+    }
+    if (!pool[i]) continue;
+    const cur = pool[i];
+    const fp = posLookup[cur.from_name];
+    const tp = posLookup[cur.to_name];
+    if (!fp || !tp) continue;
+    const tt = Math.max(0, Math.min(1, cur.t));
+    cur.position[0] = fp[0] * (1 - tt) + tp[0] * tt;
+    cur.position[1] = fp[1] * (1 - tt) + tp[1] * tt;
+  }
+}
+
+/**
+ * Top up empty slots in the pool. Used after a flush (e.g. focus
+ * change) and during the initial seed.
+ */
+function refillRides(pool, sampler, seedName, posLookup, paletteRgb, stationCluster, focusCtx) {
+  for (let i = 0; i < pool.length; i += 1) {
+    if (pool[i]) continue;
+    const fresh = focusCtx
+      ? spawnFocusedRide(focusCtx, posLookup, paletteRgb, stationCluster)
+      : spawnRide(sampler, seedName, posLookup, paletteRgb, stationCluster);
+    if (fresh) pool[i] = fresh;
+  }
+}
+
 function fitViewState(stations) {
   if (!stations.length) return { longitude: -73.98, latitude: 40.75, zoom: 10.5, pitch: 0, bearing: 0 };
   let minLat = Infinity; let maxLat = -Infinity; let minLng = Infinity; let maxLng = -Infinity;
@@ -277,8 +852,13 @@ function render({ model, el }) {
   // Grouping by domain (toggles vs station-related sliders vs nbhd-related
   // sliders) keeps related controls visually adjacent and lets each row
   // share a consistent label width within its column.
-  const TOPBAR_ROW_HEIGHT = 30;
-  const TOPBAR_HEIGHT = TOPBAR_ROW_HEIGHT * 2 + 12;
+  const TOPBAR_ROW_HEIGHT = 26;
+  // Buttons are smaller than slider rows — a slider needs vertical room
+  // for its thumb, a button doesn't. Toggle column has 3 stacked
+  // buttons; slider columns have 2 slider rows distributed top/bottom
+  // via justify-content: space-between.
+  const TOGGLE_BUTTON_HEIGHT = 20;
+  const TOPBAR_HEIGHT = 76;
   const topbar = document.createElement('div');
   topbar.style.cssText =
     'flex:0 0 auto;height:' + TOPBAR_HEIGHT + 'px;box-sizing:border-box;' +
@@ -325,16 +905,16 @@ function render({ model, el }) {
 
   // Toggle buttons live in the compact left column, stacked vertically and
   // sharing a fixed width so they read as a small switchboard.
-  const TOGGLE_WIDTH = 72;
+  const TOGGLE_WIDTH = 64;
   const makeToggle = (label, observable, modelKey) => {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.textContent = label;
     btn.style.cssText =
-      'width:' + TOGGLE_WIDTH + 'px;height:' + TOPBAR_ROW_HEIGHT + 'px;' +
-      'padding:0 8px;border:1px solid #ccc;border-radius:4px;' +
-      'background:#fff;color:#444;font:inherit;cursor:pointer;' +
-      'transition:all 0.18s;box-sizing:border-box;';
+      'width:' + TOGGLE_WIDTH + 'px;height:' + TOGGLE_BUTTON_HEIGHT + 'px;' +
+      'padding:0 6px;border:1px solid #ccc;border-radius:3px;' +
+      'background:#fff;color:#444;font:11px system-ui,sans-serif;' +
+      'line-height:1;cursor:pointer;transition:all 0.18s;box-sizing:border-box;';
     styleToggleButton(btn, observable.get());
     btn.addEventListener('click', () => {
       const next = !observable.get();
@@ -352,6 +932,7 @@ function render({ model, el }) {
 
   colToggles.appendChild(makeToggle('NBHD', store.show_neighborhoods, 'show_neighborhoods'));
   colToggles.appendChild(makeToggle('Stations', store.show_stations, 'show_stations'));
+  colToggles.appendChild(makeToggle('Rides', store.show_rides, 'show_rides'));
 
   // Slider rows share label/value column widths *within a section* so the
   // range tracks line up vertically. Two label widths because the station
@@ -642,7 +1223,7 @@ function render({ model, el }) {
       const col = stationFrom((v.col || {}).name);
       const actionKey = `mat:${col}->${row}`;
       if (actionKey === lastActionKey && seq !== lastActionSeq) {
-        setState('', [], []);
+        setDerivedState(store, { focus: '', highlights: [], edges: [], kind: null });
         lastActionKey = null;
         lastActionSeq = seq;
         log(store, 'mat toggle off', col, row);
@@ -667,7 +1248,12 @@ function render({ model, el }) {
           target: dst,
         }]
         : [];
-      setState('', [col, row].filter(Boolean), edge);
+      setDerivedState(store, {
+        focus: '',
+        highlights: [col, row].filter(Boolean),
+        edges: edge,
+        kind: 'mat_cell',
+      });
       lastActionKey = actionKey;
       lastActionSeq = seq;
       log(store, 'mat', col, '->', row, p);
@@ -681,7 +1267,7 @@ function render({ model, el }) {
       const cols = (store.selected_cols.get() || []).map(stationFrom).filter(hasStation);
 
       if (v.is_unselecting || (Array.isArray(v.selected_names) && v.selected_names.length === 0 && rows.length === 0 && cols.length === 0)) {
-        setState('', [], []);
+        setDerivedState(store, { focus: '', highlights: [], edges: [], kind: null });
         lastActionKey = null;
         lastActionSeq = seq;
         log(store, 'dendro clear', t);
@@ -697,7 +1283,7 @@ function render({ model, el }) {
       // No actionKey "toggle off" vs linkInteractionSeq here: dendrogram updates can
       // re-send the same selection across frames; toggling off would flicker.
       const actionKey = `${t}:${names.slice().sort().join('|')}`;
-      setState('', names, []);
+      setDerivedState(store, { focus: '', highlights: names, edges: [], kind: t });
       lastActionKey = actionKey;
       lastActionSeq = seq;
       log(store, 'dendro', t, 'names', names.length, 'rows', rows.length, 'cols', cols.length);
@@ -712,13 +1298,13 @@ function render({ model, el }) {
       const names = [...new Set(rawNames.map(stationFrom).filter((n) => idx[n] || coordMap[n]))];
       const actionKey = `cat:${axis}:${attrIndex}:${String(catVal)}`;
       if (actionKey === lastActionKey && seq !== lastActionSeq) {
-        setState('', [], []);
+        setDerivedState(store, { focus: '', highlights: [], edges: [], kind: null });
         lastActionKey = null;
         lastActionSeq = seq;
         log(store, 'cat toggle off', axis, catVal);
         return;
       }
-      setState('', names, []);
+      setDerivedState(store, { focus: '', highlights: names, edges: [], kind: 'cat_value' });
       lastActionKey = actionKey;
       lastActionSeq = seq;
       log(store, 'cat', axis, 'value', catVal, 'stations', names.length);
@@ -782,6 +1368,120 @@ function render({ model, el }) {
       return;
     }
   };
+
+  // ---------- Ride simulator state (closure-scoped) -------------------
+  // Pool of markov-chain walkers. Each walker remembers its current
+  // segment (from -> to, t in [0,1]); when t reaches 1 it takes a new
+  // step from the destination's distribution. State lives here in the
+  // closure so it persists across renders without needing to round-trip
+  // through the observable store. Pool length is sized per-city by
+  // `targetRidesPoolSize(stationCount)` and resized in place when the
+  // station set changes (rare — basically only first render).
+  const ridesPool = [];
+  let ridesSampler = makeRideSampler({});
+  let lastSamplerSig = '';
+  let lastFocusForRides = null;
+  let lastRidesFrameTs = 0;
+  let ridesFrame = 0;
+  const resizeRidesPool = (size) => {
+    if (ridesPool.length === size) return false;
+    if (size < ridesPool.length) {
+      ridesPool.length = size;
+    } else {
+      while (ridesPool.length < size) ridesPool.push(null);
+    }
+    return true;
+  };
+  // Cached inputs used by the rides layer. These are refreshed by the
+  // main buildLayers() pass and re-read by the standalone rides rAF, so
+  // the animation loop can produce fresh frames without re-running the
+  // entire interaction-derivation pipeline (which is what was breaking
+  // hover/click responsiveness).
+  let ridesCtx = {
+    posLookup: {},
+    palRgb: [],
+    stationCluster: new Map(),
+    spatialMix: 0,
+    focus: null,
+    focusCtx: null,
+    available: false,
+  };
+
+  const ensureSampler = (transitionTopk, stationOutflow) => {
+    const tkKeys = transitionTopk ? Object.keys(transitionTopk) : [];
+    const ofKeys = stationOutflow ? Object.keys(stationOutflow) : [];
+    const sig = `${tkKeys.length}:${tkKeys[0] || ''}|${ofKeys.length}:${ofKeys[0] || ''}`;
+    if (sig === lastSamplerSig) return false;
+    ridesSampler = makeRideSampler(transitionTopk || {}, stationOutflow || {});
+    lastSamplerSig = sig;
+    for (let i = 0; i < ridesPool.length; i += 1) ridesPool[i] = null;
+    return true;
+  };
+
+  const flushRidesForSelectionChange = (kind, focusName, focusCtx) => {
+    // Build a stable signature describing "what mode the rides are in
+    // right now". Anything that changes the spawn distribution (kind,
+    // focused station, mat-cell pair, selection set) bumps the sig.
+    let sig = kind || 'ambient';
+    if (focusCtx) {
+      if (focusCtx.mode === 'station') sig += `|${focusCtx.focus || ''}`;
+      else if (focusCtx.mode === 'mat_cell') sig += `|${focusCtx.from}->${focusCtx.to}`;
+      else if (focusCtx.mode === 'col_dendro') {
+        sig += `|out:${focusCtx.origin.names.slice().sort().join(',')}`;
+      } else if (focusCtx.mode === 'row_dendro') {
+        sig += `|in:${focusCtx.dest.names.slice().sort().join(',')}`;
+      }
+    } else if (focusName) {
+      sig += `|${focusName}`;
+    }
+    if (sig === lastFocusForRides) return false;
+    lastFocusForRides = sig;
+    for (let i = 0; i < ridesPool.length; i += 1) ridesPool[i] = null;
+    return true;
+  };
+
+  /** Build the bike-rides ScatterplotLayer using the cached `ridesCtx`. */
+  const makeRidesLayer = () => {
+    if (!ridesCtx.available) return null;
+    const { posLookup, palRgb, stationCluster, spatialMix, focus, focusCtx } = ridesCtx;
+    const now = performance.now();
+    const dtMs = lastRidesFrameTs > 0
+      ? Math.max(0, Math.min(120, now - lastRidesFrameTs))
+      : 16;
+    lastRidesFrameTs = now;
+    advanceRides(ridesPool, dtMs, ridesSampler, posLookup, palRgb, stationCluster, focusCtx);
+    refillRides(ridesPool, ridesSampler, focus || null, posLookup, palRgb, stationCluster, focusCtx);
+    ridesFrame += 1;
+    const ridesAlpha = Math.round(220 * Math.max(0, 1 - spatialMix));
+    return new ScatterplotLayer({
+      id: 'bike-rides',
+      data: ridesPool,
+      pickable: false,
+      radiusUnits: 'pixels',
+      radiusMinPixels: 0.8,
+      radiusMaxPixels: 2.2,
+      getRadius: 1.3,
+      getPosition: (d) => (d ? d.position : [0, 0]),
+      getFillColor: (d) => {
+        if (!d) return [0, 0, 0, 0];
+        const c = d.color;
+        return [c[0], c[1], c[2], ridesAlpha];
+      },
+      stroked: false,
+      // Position changes every frame; bump trigger every frame so deck.gl
+      // re-runs the accessor. Other accessors only invalidate on hops,
+      // focus/sampler swaps, or palette changes.
+      updateTriggers: {
+        getPosition: ridesFrame,
+        getFillColor: [ridesFrame, palRgb, ridesAlpha],
+      },
+    });
+  };
+
+  // Cache of the most recent non-rides layer stack so the rides rAF can
+  // splice in a fresh rides layer without rebuilding everything else
+  // (which is what was destroying hover/click interactivity at 60fps).
+  let cachedNonRidesLayers = [];
 
   const buildLayers = () => {
     const stations = store.stations.get() || [];
@@ -1210,11 +1910,73 @@ function render({ model, el }) {
       },
     });
 
+    // ---- Refresh ride simulator inputs ------------------------------
+    // We do NOT build the rides layer here every time — that would force
+    // every state-change render (sliders, hover, etc.) to also rebuild
+    // 1000 walkers. Instead we cache the inputs the rides rAF needs and
+    // let it produce its own layer. The rAF splices the rides layer
+    // into the deck via setProps, alongside the cached non-rides layers
+    // we save below. This is what restored hover/click interactivity.
+    const showRides = !!store.show_rides.get();
+    const transitionTopk = store.transition_topk.get() || {};
+    const stationOutflow = store.station_outflow.get() || {};
+    if (showRides && Object.keys(transitionTopk).length > 0) {
+      const palRgb = resolvePaletteRgb(store);
+      const stationCluster = new Map();
+      for (const s of stations) stationCluster.set(s.name, Number(s.cluster_id) || 0);
+      // Selection drives both the ride-context shape (single-station
+      // in/out, mat cell pair, dendro/cat origin or destination set)
+      // and the pool size — focused views scale to ~10% so the geometry
+      // stays legible.
+      const selectionKind = store.selection_kind.get();
+      const focusCtx = selectionKind
+        ? buildFocusedRideContext({
+          kind: selectionKind,
+          focus,
+          highlights: highlightArr,
+          edges,
+          transitionTopk,
+          stationOutflow,
+          posLookup,
+        })
+        : null;
+      const isFocused = Boolean(focusCtx);
+      // Pool resize: ambient ~2× stations clamped to [400, 5000];
+      // focused ~10% of that floored at 50 to stay visible.
+      resizeRidesPool(targetRidesPoolSize(stations.length, isFocused));
+      ensureSampler(transitionTopk, stationOutflow);
+      // Flush the pool whenever the selection kind/identity changes so
+      // the swarm switches cleanly between modes (no stale rides from
+      // a prior focus continuing under the new one).
+      flushRidesForSelectionChange(selectionKind, focus, focusCtx);
+      ridesCtx = {
+        posLookup,
+        palRgb,
+        stationCluster,
+        spatialMix,
+        focus: focus || null,
+        focusCtx,
+        available: true,
+      };
+    } else {
+      ridesCtx = { ...ridesCtx, available: false };
+      lastRidesFrameTs = 0;
+    }
+
     const basemapAlpha = Math.round(255 * (1 - spatialMix));
-    // Order matters: basemap, then neighborhood polygons, then flow lines,
-    // then station points on top. Station picking shadows polygon picking —
-    // stations stay clickable when NBHDs are visible.
-    return [basemapLayer(basemapAlpha), polygons, lines, points];
+    // Non-rides layers in render order. We cache this so the rides rAF
+    // can append a fresh rides layer without redoing the work above.
+    const nonRides = [basemapLayer(basemapAlpha), polygons, lines, points];
+    cachedNonRidesLayers = nonRides;
+    if (ridesCtx.available) {
+      const ridesLayer = makeRidesLayer();
+      if (ridesLayer) {
+        // Insert just below the station points so dots overlay cluster
+        // colors but don't shadow station picking.
+        return [...nonRides.slice(0, -1), ridesLayer, nonRides[nonRides.length - 1]];
+      }
+    }
+    return nonRides;
   };
 
   let pendingProps = null;
@@ -1342,7 +2104,45 @@ function render({ model, el }) {
     store.pinned_cluster,
     store.station_size_mult,
     store.nbhd_opacity_mult,
+    store.transition_topk,
+    store.station_outflow,
+    store.show_rides,
+    store.selection_kind,
   ].forEach((obs) => obs.subscribe(() => scheduleRender(), { immediate: false }));
+
+  // ---- Rides animation loop ------------------------------------------
+  // Standalone rAF that only swaps the bike-rides layer in; all other
+  // layers come from the cached `cachedNonRidesLayers`. This bypasses
+  // computeStateFromInputs / prepareDeckProps / deck.redraw entirely
+  // each frame, which is what made hover/click feel jammed when rides
+  // were on (the main pipeline was being re-run 60×/sec).
+  let ridesRaf = 0;
+  const ridesTick = () => {
+    ridesRaf = 0;
+    if (!store.show_rides.get()) return;
+    if (!ridesCtx.available) return;
+    if (!deck) return;
+    const ridesLayer = makeRidesLayer();
+    if (ridesLayer && cachedNonRidesLayers.length) {
+      // Splice rides just below the station points (last cached layer)
+      // so dots overlay cluster colors but don't shadow station picking.
+      const layers = [
+        ...cachedNonRidesLayers.slice(0, -1),
+        ridesLayer,
+        cachedNonRidesLayers[cachedNonRidesLayers.length - 1],
+      ];
+      deck.setProps({ layers });
+    }
+    ridesRaf = requestAnimationFrame(ridesTick);
+  };
+  const ensureRidesAnimating = () => {
+    if (ridesRaf) return;
+    if (!store.show_rides.get()) return;
+    if (!Object.keys(store.transition_topk.get() || {}).length) return;
+    ridesRaf = requestAnimationFrame(ridesTick);
+  };
+  store.show_rides.subscribe(() => ensureRidesAnimating(), { immediate: false });
+  store.transition_topk.subscribe(() => ensureRidesAnimating(), { immediate: false });
 
   const syncFromModel = () => {
     const ci = JSON.stringify(model.get('click_info') || {});
@@ -1372,6 +2172,11 @@ function render({ model, el }) {
     store.alpha_index.set(Number.isFinite(ai) ? (ai | 0) : 4);
     store.show_neighborhoods.set(Boolean(model.get('show_neighborhoods') ?? true));
     store.show_stations.set(Boolean(model.get('show_stations') ?? true));
+    store.show_rides.set(Boolean(model.get('show_rides') ?? true));
+    const tk = model.get('transition_topk') || {};
+    store.transition_topk.set(tk && typeof tk === 'object' ? tk : {});
+    const so = model.get('station_outflow') || {};
+    store.station_outflow.set(so && typeof so === 'object' ? so : {});
     log(store, 'syncFromModel done', {
       linkSeq: linkInteractionSeq,
       rows: (store.selected_rows.get() || []).length,
@@ -1401,6 +2206,9 @@ function render({ model, el }) {
     'alpha_index',
     'show_neighborhoods',
     'show_stations',
+    'show_rides',
+    'transition_topk',
+    'station_outflow',
   ].forEach((name) => model.on(`change:${name}`, syncFromModel));
 
   model.on('change:cg_row_names', () => scheduleRender());
@@ -1411,6 +2219,7 @@ function render({ model, el }) {
   return () => {
     clearTimeout(hoverTimer);
     if (raf) cancelAnimationFrame(raf);
+    if (ridesRaf) cancelAnimationFrame(ridesRaf);
     if (deck) deck.finalize();
   };
 }

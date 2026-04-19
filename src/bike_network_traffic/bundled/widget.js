@@ -45245,6 +45245,17 @@ var createStore = () => ({
   focus: Observable(""),
   highlights: Observable([]),
   edges: Observable([]),
+  // What *kind* of selection produced the current focus/highlights/edges.
+  // Drives the rides simulator's focused-mode behaviour:
+  //   null            — no selection, full ambient walk
+  //   'station'       — a single station was clicked (map or row/col label)
+  //   'mat_cell'      — a single matrix cell click (one origin → one dest)
+  //   'col_dendro'    — selected origins (outgoing rides only)
+  //   'row_dendro'    — selected destinations (incoming rides only)
+  //   'cat_value'     — manual category selection (treated like col_dendro
+  //                      since the natural interpretation is "rides
+  //                      starting from any of these stations")
+  selection_kind: Observable(null),
   deck_check: Observable({ inputs: true, computed: true, layers: true }),
   deck_ready: Observable(false),
   palette_rgb: Observable([]),
@@ -45264,12 +45275,24 @@ var createStore = () => ({
   // synced to Python traitlets — they tweak the visual treatment without
   // changing the semantic state of the map.
   station_size_mult: Observable(1),
-  nbhd_opacity_mult: Observable(0.4)
+  nbhd_opacity_mult: Observable(0.4),
+  // Animated bike-ride simulation. transition_topk is a sparse top-K
+  // destination distribution per origin (shipped from Python);
+  // station_outflow holds raw per-station outflow counts (also from
+  // Python, when raw trips are available) used to weight initial bike
+  // placements and rebalancing teleports by true trip volume;
+  // show_rides toggles the layer; current_time is the wall-clock used
+  // by the random walker (it advances every animation frame while
+  // rides are visible).
+  transition_topk: Observable({}),
+  station_outflow: Observable({}),
+  show_rides: Observable(true),
+  current_time: Observable(0)
 });
 var log3 = (store, ...args) => {
   if (store.debug.get()) console.log("[bike-map]", ...args);
 };
-var MAP_STATION_SLICE_TOP_K = 25;
+var MAP_STATION_SLICE_TOP_K = 30;
 function pushRowColMatrixSliceRequest(model, rowIndex, colIndex) {
   if (!model?.set) return;
   const req_id = typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `r${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -45301,13 +45324,16 @@ var sameList = (a2, b2) => {
   for (let i2 = 0; i2 < a2.length; i2 += 1) if (a2[i2] !== b2[i2]) return false;
   return true;
 };
-var setDerivedState = (store, { focus, highlights, edges }) => {
+var setDerivedState = (store, { focus, highlights, edges, kind }) => {
   const curFocus = store.focus.get() || "";
   const curHighlights = store.highlights.get() || [];
   const curEdges = store.edges.get() || [];
+  const curKind = store.selection_kind.get() || null;
   const nextFocus = focus || "";
   const nextHighlights = highlights || [];
   const nextEdges = edges || [];
+  const inferredKind = nextFocus ? "station" : null;
+  const nextKind = kind === void 0 ? inferredKind : kind;
   let changed = false;
   if (curFocus !== nextFocus) {
     store.focus.set(nextFocus);
@@ -45321,6 +45347,10 @@ var setDerivedState = (store, { focus, highlights, edges }) => {
   const nextStr = JSON.stringify(nextEdges);
   if (curStr !== nextStr) {
     store.edges.set(nextEdges);
+    changed = true;
+  }
+  if (curKind !== nextKind) {
+    store.selection_kind.set(nextKind);
     changed = true;
   }
   return changed;
@@ -45453,6 +45483,369 @@ function flowBlendWithAlpha(outW, inW, alpha) {
   const [r2, g2, b2] = flowBlendRgb(outW, inW);
   return [r2, g2, b2, alpha];
 }
+var RIDES_PER_STATION = 2;
+var RIDES_POOL_MIN = 400;
+var RIDES_POOL_MAX = 5e3;
+var RIDES_FOCUSED_FRACTION = 0.1;
+var RIDES_FOCUSED_MIN = 50;
+function targetRidesPoolSize(numStations, focused = false) {
+  const n2 = Math.round(Number(numStations) || 0);
+  const ambient = Math.max(
+    RIDES_POOL_MIN,
+    Math.min(RIDES_POOL_MAX, Math.round(n2 * RIDES_PER_STATION) || RIDES_POOL_MIN)
+  );
+  if (!focused) return ambient;
+  return Math.max(RIDES_FOCUSED_MIN, Math.round(ambient * RIDES_FOCUSED_FRACTION));
+}
+var RIDE_MS_PER_DEG = 18e4;
+var RIDE_SEG_VEL_JITTER = 0.18;
+var RIDE_SEG_MIN_MS = 250;
+var RIDE_INITIAL_T_SCATTER = true;
+var RIDE_TELEPORT_PROB = 0.05;
+var RIDE_STATIONARY_ITERS = 30;
+function makeRideSampler(transitionTopk, stationOutflow) {
+  const origins = [];
+  const cdfByOrigin = /* @__PURE__ */ new Map();
+  for (const [origin, entries] of Object.entries(transitionTopk || {})) {
+    if (!Array.isArray(entries) || entries.length === 0) continue;
+    let total = 0;
+    const dests = new Array(entries.length);
+    const cum = new Float64Array(entries.length);
+    for (let i2 = 0; i2 < entries.length; i2 += 1) {
+      const e2 = entries[i2];
+      const w2 = Math.max(0, Number(e2?.[1]) || 0);
+      total += w2;
+      dests[i2] = String(e2?.[0] || "");
+      cum[i2] = total;
+    }
+    if (total <= 0) continue;
+    origins.push(origin);
+    cdfByOrigin.set(origin, { dests, cum, total });
+  }
+  const N2 = origins.length;
+  const weights = new Float64Array(N2);
+  const useRawOutflow = stationOutflow && typeof stationOutflow === "object" && Object.keys(stationOutflow).length > 0;
+  if (useRawOutflow) {
+    for (let i2 = 0; i2 < N2; i2 += 1) {
+      const w2 = Number(stationOutflow[origins[i2]]) || 0;
+      weights[i2] = w2 > 0 ? w2 : 0;
+    }
+  } else {
+    const idxByName = /* @__PURE__ */ new Map();
+    for (let i2 = 0; i2 < N2; i2 += 1) idxByName.set(origins[i2], i2);
+    let pi = new Float64Array(N2);
+    if (N2 > 0) pi.fill(1 / N2);
+    for (let iter = 0; iter < RIDE_STATIONARY_ITERS && N2 > 0; iter += 1) {
+      const next = new Float64Array(N2);
+      for (let oi = 0; oi < N2; oi += 1) {
+        const massHere = pi[oi];
+        if (massHere <= 0) continue;
+        const entry = cdfByOrigin.get(origins[oi]);
+        if (!entry) continue;
+        const { dests, cum, total } = entry;
+        let prevCum = 0;
+        for (let kk = 0; kk < dests.length; kk += 1) {
+          const w2 = (cum[kk] - prevCum) / total;
+          prevCum = cum[kk];
+          const di = idxByName.get(dests[kk]);
+          if (di != null) next[di] += w2 * massHere;
+        }
+      }
+      let sum = 0;
+      for (let i2 = 0; i2 < N2; i2 += 1) sum += next[i2];
+      if (sum <= 0) break;
+      for (let i2 = 0; i2 < N2; i2 += 1) pi[i2] = next[i2] / sum;
+    }
+    for (let i2 = 0; i2 < N2; i2 += 1) weights[i2] = pi[i2];
+  }
+  const teleportNames = [];
+  let teleportTotal = 0;
+  const teleportCum = [];
+  for (let i2 = 0; i2 < N2; i2 += 1) {
+    const w2 = weights[i2];
+    if (w2 <= 0) continue;
+    teleportTotal += w2;
+    teleportNames.push(origins[i2]);
+    teleportCum.push(teleportTotal);
+  }
+  const pickFromCum = (names, cum, total, exclude) => {
+    if (!names.length || total <= 0) return null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const u2 = Math.random() * total;
+      let pick = names[names.length - 1];
+      for (let i2 = 0; i2 < cum.length; i2 += 1) {
+        if (u2 < cum[i2]) {
+          pick = names[i2];
+          break;
+        }
+      }
+      if (pick !== exclude) return pick;
+    }
+    return names[0] !== exclude ? names[0] : names[1] || names[0];
+  };
+  const pickFrom = (entry, exclude) => {
+    if (!entry) return null;
+    return pickFromCum(entry.dests, entry.cum, entry.total, exclude);
+  };
+  const teleport = (exclude) => pickFromCum(teleportNames, teleportCum, teleportTotal, exclude);
+  return {
+    origins,
+    /** Teleport-weighted initial pick — used to seed the pool. */
+    pickInitial() {
+      if (teleportTotal > 0) return teleport(null);
+      if (origins.length === 0) return null;
+      return origins[Math.random() * origins.length | 0];
+    },
+    /**
+     * One markov step from `currentName`. With probability
+     * RIDE_TELEPORT_PROB we ignore the local distribution and teleport
+     * to an inflow-weighted random destination — this keeps the walk
+     * from collapsing into low-volume cycles in the outer boroughs.
+     */
+    sampleNext(currentName) {
+      if (origins.length === 0) return null;
+      if (Math.random() < RIDE_TELEPORT_PROB) {
+        const t2 = teleport(currentName);
+        if (t2) return t2;
+      }
+      const entry = cdfByOrigin.get(currentName);
+      if (entry) return pickFrom(entry, currentName);
+      return teleport(currentName) || origins[Math.random() * origins.length | 0];
+    }
+  };
+}
+function rideSegmentDuration(fromPos, toPos) {
+  const dlng = toPos[0] - fromPos[0];
+  const dlat = toPos[1] - fromPos[1];
+  const dist4 = Math.sqrt(dlng * dlng + dlat * dlat);
+  const jitter = 1 + (Math.random() - 0.5) * 2 * RIDE_SEG_VEL_JITTER;
+  return Math.max(RIDE_SEG_MIN_MS, dist4 * RIDE_MS_PER_DEG * jitter);
+}
+function pickFromCdfArr(names, cum, total) {
+  if (!names.length || total <= 0) return null;
+  const u2 = Math.random() * total;
+  for (let i2 = 0; i2 < cum.length; i2 += 1) {
+    if (u2 < cum[i2]) return names[i2];
+  }
+  return names[names.length - 1];
+}
+function buildWeightedCdf(weighted, posLookup) {
+  const names = [];
+  const cum = [];
+  let total = 0;
+  for (const [name2, weight] of weighted) {
+    if (!name2 || !posLookup[name2]) continue;
+    const w2 = Math.max(0, Number(weight) || 0);
+    if (w2 <= 0) continue;
+    total += w2;
+    names.push(name2);
+    cum.push(total);
+  }
+  if (total <= 0) return null;
+  return { names, cum, total };
+}
+function buildFocusedRideContext({
+  kind,
+  focus,
+  highlights,
+  edges,
+  transitionTopk,
+  stationOutflow,
+  posLookup
+}) {
+  const has = (n2) => Boolean(n2) && Boolean(posLookup[n2]);
+  if (kind === "station") {
+    if (!has(focus)) return null;
+    const outPairs = [];
+    const inPairs = [];
+    for (const e2 of edges || []) {
+      const w2 = Math.max(0, Number(e2?.weight) || 0);
+      if (w2 <= 0) continue;
+      if (e2.direction === "out" && e2.source_name === focus && has(e2.target_name)) {
+        outPairs.push([e2.target_name, w2]);
+      } else if (e2.direction === "in" && e2.target_name === focus && has(e2.source_name)) {
+        inPairs.push([e2.source_name, w2]);
+      }
+    }
+    const out = buildWeightedCdf(outPairs, posLookup);
+    const inn = buildWeightedCdf(inPairs, posLookup);
+    if (!out && !inn) return null;
+    return { mode: "station", focus, out, inn };
+  }
+  if (kind === "mat_cell") {
+    const e2 = (edges || []).find((x2) => x2 && x2.direction === "direct");
+    if (!e2 || !has(e2.source_name) || !has(e2.target_name)) return null;
+    return { mode: "mat_cell", from: e2.source_name, to: e2.target_name };
+  }
+  if (kind === "col_dendro" || kind === "cat_value") {
+    const sel = (highlights || []).filter(has);
+    if (sel.length === 0) return null;
+    const useOutflow = stationOutflow && Object.keys(stationOutflow).length > 0;
+    const originPairs = sel.map((n2) => [n2, useOutflow ? Number(stationOutflow[n2]) || 1 : 1]);
+    const origin = buildWeightedCdf(originPairs, posLookup);
+    if (!origin) return null;
+    const destByOrigin = /* @__PURE__ */ new Map();
+    for (const o2 of sel) {
+      const entries = (transitionTopk || {})[o2];
+      if (!Array.isArray(entries) || entries.length === 0) continue;
+      const cdf = buildWeightedCdf(
+        entries.filter((row) => row && row[0] !== o2).map((row) => [String(row[0]), Number(row[1]) || 0]),
+        posLookup
+      );
+      if (cdf) destByOrigin.set(o2, cdf);
+    }
+    if (destByOrigin.size === 0) return null;
+    return { mode: "col_dendro", origin, destByOrigin };
+  }
+  if (kind === "row_dendro") {
+    const sel = (highlights || []).filter(has);
+    if (sel.length === 0) return null;
+    const selSet = new Set(sel);
+    const inflowByDest = /* @__PURE__ */ new Map();
+    for (const d2 of sel) inflowByDest.set(d2, []);
+    for (const [origin, entries] of Object.entries(transitionTopk || {})) {
+      if (!Array.isArray(entries) || entries.length === 0) continue;
+      if (!has(origin)) continue;
+      for (const row of entries) {
+        const dest2 = String(row?.[0] || "");
+        if (!selSet.has(dest2) || dest2 === origin) continue;
+        const w2 = Number(row?.[1]) || 0;
+        if (w2 <= 0) continue;
+        inflowByDest.get(dest2).push([origin, w2]);
+      }
+    }
+    const originByDest = /* @__PURE__ */ new Map();
+    const destPairs = [];
+    for (const d2 of sel) {
+      const cdf = buildWeightedCdf(inflowByDest.get(d2) || [], posLookup);
+      if (!cdf) continue;
+      originByDest.set(d2, cdf);
+      destPairs.push([d2, cdf.total]);
+    }
+    if (destPairs.length === 0) return null;
+    const dest = buildWeightedCdf(destPairs, posLookup);
+    if (!dest) return null;
+    return { mode: "row_dendro", dest, originByDest };
+  }
+  return null;
+}
+function spawnFocusedRide(focusCtx, posLookup, paletteRgb, stationCluster) {
+  let from = null;
+  let to = null;
+  if (focusCtx.mode === "station") {
+    const { focus, out, inn } = focusCtx;
+    const outTotal = out ? out.total : 0;
+    const inTotal = inn ? inn.total : 0;
+    const total = outTotal + inTotal;
+    if (total <= 0) return null;
+    const goingOut = Math.random() * total < outTotal;
+    if (goingOut && out) {
+      from = focus;
+      to = pickFromCdfArr(out.names, out.cum, out.total);
+    } else if (inn) {
+      from = pickFromCdfArr(inn.names, inn.cum, inn.total);
+      to = focus;
+    }
+  } else if (focusCtx.mode === "mat_cell") {
+    from = focusCtx.from;
+    to = focusCtx.to;
+  } else if (focusCtx.mode === "col_dendro") {
+    const o2 = pickFromCdfArr(focusCtx.origin.names, focusCtx.origin.cum, focusCtx.origin.total);
+    if (!o2) return null;
+    const cdf = focusCtx.destByOrigin.get(o2);
+    if (!cdf) return null;
+    from = o2;
+    to = pickFromCdfArr(cdf.names, cdf.cum, cdf.total);
+  } else if (focusCtx.mode === "row_dendro") {
+    const d2 = pickFromCdfArr(focusCtx.dest.names, focusCtx.dest.cum, focusCtx.dest.total);
+    if (!d2) return null;
+    const cdf = focusCtx.originByDest.get(d2);
+    if (!cdf) return null;
+    from = pickFromCdfArr(cdf.names, cdf.cum, cdf.total);
+    to = d2;
+  }
+  if (!from || !to || !posLookup[from] || !posLookup[to]) return null;
+  const cid = stationCluster?.get(from);
+  return {
+    from_name: from,
+    to_name: to,
+    t: RIDE_INITIAL_T_SCATTER ? Math.random() : 0,
+    duration: rideSegmentDuration(posLookup[from], posLookup[to]),
+    color: clusterRgbFromId(cid != null ? cid : 0, paletteRgb),
+    position: [posLookup[from][0], posLookup[from][1]],
+    focused: true
+  };
+}
+function spawnRide(sampler, seedName, posLookup, paletteRgb, stationCluster) {
+  const start = seedName && posLookup[seedName] ? seedName : sampler.pickInitial();
+  if (!start) return null;
+  const next = sampler.sampleNext(start);
+  if (!next || !posLookup[start] || !posLookup[next]) return null;
+  const cid = stationCluster?.get(start);
+  return {
+    from_name: start,
+    to_name: next,
+    // `t` is the progress along the current segment in [0, 1]. We
+    // scatter the initial value so 1000 rides appear as a steady stream
+    // rather than all departing in lockstep.
+    t: RIDE_INITIAL_T_SCATTER ? Math.random() : 0,
+    duration: rideSegmentDuration(posLookup[start], posLookup[next]),
+    color: clusterRgbFromId(cid != null ? cid : 0, paletteRgb),
+    // Live position; recomputed each frame from posLookup so rides morph
+    // alongside stations when the Spatial↔UMAP slider moves.
+    position: [posLookup[start][0], posLookup[start][1]]
+  };
+}
+function advanceRides(pool, dtMs, sampler, posLookup, paletteRgb, stationCluster, focusCtx) {
+  for (let i2 = 0; i2 < pool.length; i2 += 1) {
+    const r2 = pool[i2];
+    if (!r2) continue;
+    const fromPos = posLookup[r2.from_name];
+    let toPos = posLookup[r2.to_name];
+    if (!fromPos || !toPos) {
+      pool[i2] = null;
+      continue;
+    }
+    r2.t += dtMs / Math.max(50, r2.duration);
+    if (r2.t >= 1) {
+      if (r2.focused) {
+        pool[i2] = null;
+        continue;
+      }
+      while (r2.t >= 1) {
+        const overshoot = r2.t - 1;
+        r2.from_name = r2.to_name;
+        const nextName = sampler.sampleNext(r2.from_name) || sampler.pickInitial();
+        if (!nextName || !posLookup[nextName]) {
+          pool[i2] = null;
+          break;
+        }
+        r2.to_name = nextName;
+        const newFrom = posLookup[r2.from_name];
+        const newTo = posLookup[r2.to_name];
+        r2.duration = rideSegmentDuration(newFrom, newTo);
+        const cid = stationCluster?.get(r2.from_name);
+        r2.color = clusterRgbFromId(cid != null ? cid : 0, paletteRgb);
+        r2.t = overshoot;
+      }
+    }
+    if (!pool[i2]) continue;
+    const cur = pool[i2];
+    const fp = posLookup[cur.from_name];
+    const tp = posLookup[cur.to_name];
+    if (!fp || !tp) continue;
+    const tt2 = Math.max(0, Math.min(1, cur.t));
+    cur.position[0] = fp[0] * (1 - tt2) + tp[0] * tt2;
+    cur.position[1] = fp[1] * (1 - tt2) + tp[1] * tt2;
+  }
+}
+function refillRides(pool, sampler, seedName, posLookup, paletteRgb, stationCluster, focusCtx) {
+  for (let i2 = 0; i2 < pool.length; i2 += 1) {
+    if (pool[i2]) continue;
+    const fresh = focusCtx ? spawnFocusedRide(focusCtx, posLookup, paletteRgb, stationCluster) : spawnRide(sampler, seedName, posLookup, paletteRgb, stationCluster);
+    if (fresh) pool[i2] = fresh;
+  }
+}
 function fitViewState(stations) {
   if (!stations.length) return { longitude: -73.98, latitude: 40.75, zoom: 10.5, pitch: 0, bearing: 0 };
   let minLat = Infinity;
@@ -45479,8 +45872,9 @@ function render({ model, el }) {
   const root = document.createElement("div");
   root.style.cssText = "background:#e2e4e8;border-radius:4px;overflow:hidden;display:flex;flex-direction:column;";
   el.appendChild(root);
-  const TOPBAR_ROW_HEIGHT = 30;
-  const TOPBAR_HEIGHT = TOPBAR_ROW_HEIGHT * 2 + 12;
+  const TOPBAR_ROW_HEIGHT = 26;
+  const TOGGLE_BUTTON_HEIGHT = 20;
+  const TOPBAR_HEIGHT = 76;
   const topbar = document.createElement("div");
   topbar.style.cssText = "flex:0 0 auto;height:" + TOPBAR_HEIGHT + "px;box-sizing:border-box;display:flex;flex-direction:row;align-items:stretch;gap:14px;padding:6px 12px;background:#f5f6f8;border-bottom:1px solid #d0d3d8;font:12px system-ui,sans-serif;color:#333;user-select:none;";
   root.appendChild(topbar);
@@ -45508,12 +45902,12 @@ function render({ model, el }) {
     btn.style.color = on ? "#fff" : "#444";
     btn.style.borderColor = on ? "#1f77b4" : "#ccc";
   };
-  const TOGGLE_WIDTH = 72;
+  const TOGGLE_WIDTH = 64;
   const makeToggle = (label, observable, modelKey) => {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.textContent = label;
-    btn.style.cssText = "width:" + TOGGLE_WIDTH + "px;height:" + TOPBAR_ROW_HEIGHT + "px;padding:0 8px;border:1px solid #ccc;border-radius:4px;background:#fff;color:#444;font:inherit;cursor:pointer;transition:all 0.18s;box-sizing:border-box;";
+    btn.style.cssText = "width:" + TOGGLE_WIDTH + "px;height:" + TOGGLE_BUTTON_HEIGHT + "px;padding:0 6px;border:1px solid #ccc;border-radius:3px;background:#fff;color:#444;font:11px system-ui,sans-serif;line-height:1;cursor:pointer;transition:all 0.18s;box-sizing:border-box;";
     styleToggleButton(btn, observable.get());
     btn.addEventListener("click", () => {
       const next = !observable.get();
@@ -45530,6 +45924,7 @@ function render({ model, el }) {
   };
   colToggles.appendChild(makeToggle("NBHD", store.show_neighborhoods, "show_neighborhoods"));
   colToggles.appendChild(makeToggle("Stations", store.show_stations, "show_stations"));
+  colToggles.appendChild(makeToggle("Rides", store.show_rides, "show_rides"));
   const STATION_LABEL_W = 78;
   const NBHD_LABEL_W = 50;
   const VALUE_W = 48;
@@ -45784,7 +46179,7 @@ function render({ model, el }) {
       const col = stationFrom((v2.col || {}).name);
       const actionKey = `mat:${col}->${row}`;
       if (actionKey === lastActionKey && seq !== lastActionSeq) {
-        setState("", [], []);
+        setDerivedState(store, { focus: "", highlights: [], edges: [], kind: null });
         lastActionKey = null;
         lastActionSeq = seq;
         log3(store, "mat toggle off", col, row);
@@ -45807,7 +46202,12 @@ function render({ model, el }) {
         source: src,
         target: dst
       }] : [];
-      setState("", [col, row].filter(Boolean), edge);
+      setDerivedState(store, {
+        focus: "",
+        highlights: [col, row].filter(Boolean),
+        edges: edge,
+        kind: "mat_cell"
+      });
       lastActionKey = actionKey;
       lastActionSeq = seq;
       log3(store, "mat", col, "->", row, p2);
@@ -45819,7 +46219,7 @@ function render({ model, el }) {
       const rows = (store.selected_rows.get() || []).map(stationFrom).filter(hasStation);
       const cols = (store.selected_cols.get() || []).map(stationFrom).filter(hasStation);
       if (v2.is_unselecting || Array.isArray(v2.selected_names) && v2.selected_names.length === 0 && rows.length === 0 && cols.length === 0) {
-        setState("", [], []);
+        setDerivedState(store, { focus: "", highlights: [], edges: [], kind: null });
         lastActionKey = null;
         lastActionSeq = seq;
         log3(store, "dendro clear", t2);
@@ -45827,7 +46227,7 @@ function render({ model, el }) {
       }
       const names = t2 === "col_dendro" ? cols.length ? cols : fromClick.length ? fromClick : rows : rows.length ? rows : fromClick.length ? fromClick : cols;
       const actionKey = `${t2}:${names.slice().sort().join("|")}`;
-      setState("", names, []);
+      setDerivedState(store, { focus: "", highlights: names, edges: [], kind: t2 });
       lastActionKey = actionKey;
       lastActionSeq = seq;
       log3(store, "dendro", t2, "names", names.length, "rows", rows.length, "cols", cols.length);
@@ -45841,13 +46241,13 @@ function render({ model, el }) {
       const names = [...new Set(rawNames.map(stationFrom).filter((n2) => idx[n2] || coordMap[n2]))];
       const actionKey = `cat:${axis}:${attrIndex}:${String(catVal)}`;
       if (actionKey === lastActionKey && seq !== lastActionSeq) {
-        setState("", [], []);
+        setDerivedState(store, { focus: "", highlights: [], edges: [], kind: null });
         lastActionKey = null;
         lastActionSeq = seq;
         log3(store, "cat toggle off", axis, catVal);
         return;
       }
-      setState("", names, []);
+      setDerivedState(store, { focus: "", highlights: names, edges: [], kind: "cat_value" });
       lastActionKey = actionKey;
       lastActionSeq = seq;
       log3(store, "cat", axis, "value", catVal, "stations", names.length);
@@ -45909,6 +46309,93 @@ function render({ model, el }) {
       return;
     }
   };
+  const ridesPool = [];
+  let ridesSampler = makeRideSampler({});
+  let lastSamplerSig = "";
+  let lastFocusForRides = null;
+  let lastRidesFrameTs = 0;
+  let ridesFrame = 0;
+  const resizeRidesPool = (size) => {
+    if (ridesPool.length === size) return false;
+    if (size < ridesPool.length) {
+      ridesPool.length = size;
+    } else {
+      while (ridesPool.length < size) ridesPool.push(null);
+    }
+    return true;
+  };
+  let ridesCtx = {
+    posLookup: {},
+    palRgb: [],
+    stationCluster: /* @__PURE__ */ new Map(),
+    spatialMix: 0,
+    focus: null,
+    focusCtx: null,
+    available: false
+  };
+  const ensureSampler = (transitionTopk, stationOutflow) => {
+    const tkKeys = transitionTopk ? Object.keys(transitionTopk) : [];
+    const ofKeys = stationOutflow ? Object.keys(stationOutflow) : [];
+    const sig = `${tkKeys.length}:${tkKeys[0] || ""}|${ofKeys.length}:${ofKeys[0] || ""}`;
+    if (sig === lastSamplerSig) return false;
+    ridesSampler = makeRideSampler(transitionTopk || {}, stationOutflow || {});
+    lastSamplerSig = sig;
+    for (let i2 = 0; i2 < ridesPool.length; i2 += 1) ridesPool[i2] = null;
+    return true;
+  };
+  const flushRidesForSelectionChange = (kind, focusName, focusCtx) => {
+    let sig = kind || "ambient";
+    if (focusCtx) {
+      if (focusCtx.mode === "station") sig += `|${focusCtx.focus || ""}`;
+      else if (focusCtx.mode === "mat_cell") sig += `|${focusCtx.from}->${focusCtx.to}`;
+      else if (focusCtx.mode === "col_dendro") {
+        sig += `|out:${focusCtx.origin.names.slice().sort().join(",")}`;
+      } else if (focusCtx.mode === "row_dendro") {
+        sig += `|in:${focusCtx.dest.names.slice().sort().join(",")}`;
+      }
+    } else if (focusName) {
+      sig += `|${focusName}`;
+    }
+    if (sig === lastFocusForRides) return false;
+    lastFocusForRides = sig;
+    for (let i2 = 0; i2 < ridesPool.length; i2 += 1) ridesPool[i2] = null;
+    return true;
+  };
+  const makeRidesLayer = () => {
+    if (!ridesCtx.available) return null;
+    const { posLookup, palRgb, stationCluster, spatialMix, focus, focusCtx } = ridesCtx;
+    const now = performance.now();
+    const dtMs = lastRidesFrameTs > 0 ? Math.max(0, Math.min(120, now - lastRidesFrameTs)) : 16;
+    lastRidesFrameTs = now;
+    advanceRides(ridesPool, dtMs, ridesSampler, posLookup, palRgb, stationCluster, focusCtx);
+    refillRides(ridesPool, ridesSampler, focus || null, posLookup, palRgb, stationCluster, focusCtx);
+    ridesFrame += 1;
+    const ridesAlpha = Math.round(220 * Math.max(0, 1 - spatialMix));
+    return new scatterplot_layer_default({
+      id: "bike-rides",
+      data: ridesPool,
+      pickable: false,
+      radiusUnits: "pixels",
+      radiusMinPixels: 0.8,
+      radiusMaxPixels: 2.2,
+      getRadius: 1.3,
+      getPosition: (d2) => d2 ? d2.position : [0, 0],
+      getFillColor: (d2) => {
+        if (!d2) return [0, 0, 0, 0];
+        const c2 = d2.color;
+        return [c2[0], c2[1], c2[2], ridesAlpha];
+      },
+      stroked: false,
+      // Position changes every frame; bump trigger every frame so deck.gl
+      // re-runs the accessor. Other accessors only invalidate on hops,
+      // focus/sampler swaps, or palette changes.
+      updateTriggers: {
+        getPosition: ridesFrame,
+        getFillColor: [ridesFrame, palRgb, ridesAlpha]
+      }
+    });
+  };
+  let cachedNonRidesLayers = [];
   const buildLayers = () => {
     const stations = store.stations.get() || [];
     const focus = store.focus.get();
@@ -46255,8 +46742,50 @@ function render({ model, el }) {
         return [24, 28, 36, Math.max(220, a2)];
       }
     });
+    const showRides = !!store.show_rides.get();
+    const transitionTopk = store.transition_topk.get() || {};
+    const stationOutflow = store.station_outflow.get() || {};
+    if (showRides && Object.keys(transitionTopk).length > 0) {
+      const palRgb2 = resolvePaletteRgb(store);
+      const stationCluster = /* @__PURE__ */ new Map();
+      for (const s2 of stations) stationCluster.set(s2.name, Number(s2.cluster_id) || 0);
+      const selectionKind = store.selection_kind.get();
+      const focusCtx = selectionKind ? buildFocusedRideContext({
+        kind: selectionKind,
+        focus,
+        highlights: highlightArr,
+        edges,
+        transitionTopk,
+        stationOutflow,
+        posLookup
+      }) : null;
+      const isFocused = Boolean(focusCtx);
+      resizeRidesPool(targetRidesPoolSize(stations.length, isFocused));
+      ensureSampler(transitionTopk, stationOutflow);
+      flushRidesForSelectionChange(selectionKind, focus, focusCtx);
+      ridesCtx = {
+        posLookup,
+        palRgb: palRgb2,
+        stationCluster,
+        spatialMix,
+        focus: focus || null,
+        focusCtx,
+        available: true
+      };
+    } else {
+      ridesCtx = { ...ridesCtx, available: false };
+      lastRidesFrameTs = 0;
+    }
     const basemapAlpha = Math.round(255 * (1 - spatialMix));
-    return [basemapLayer(basemapAlpha), polygons, lines, points];
+    const nonRides = [basemapLayer(basemapAlpha), polygons, lines, points];
+    cachedNonRidesLayers = nonRides;
+    if (ridesCtx.available) {
+      const ridesLayer = makeRidesLayer();
+      if (ridesLayer) {
+        return [...nonRides.slice(0, -1), ridesLayer, nonRides[nonRides.length - 1]];
+      }
+    }
+    return nonRides;
   };
   let pendingProps = null;
   const prepareDeckProps = () => {
@@ -46360,8 +46889,37 @@ function render({ model, el }) {
     store.show_stations,
     store.pinned_cluster,
     store.station_size_mult,
-    store.nbhd_opacity_mult
+    store.nbhd_opacity_mult,
+    store.transition_topk,
+    store.station_outflow,
+    store.show_rides,
+    store.selection_kind
   ].forEach((obs) => obs.subscribe(() => scheduleRender(), { immediate: false }));
+  let ridesRaf = 0;
+  const ridesTick = () => {
+    ridesRaf = 0;
+    if (!store.show_rides.get()) return;
+    if (!ridesCtx.available) return;
+    if (!deck) return;
+    const ridesLayer = makeRidesLayer();
+    if (ridesLayer && cachedNonRidesLayers.length) {
+      const layers = [
+        ...cachedNonRidesLayers.slice(0, -1),
+        ridesLayer,
+        cachedNonRidesLayers[cachedNonRidesLayers.length - 1]
+      ];
+      deck.setProps({ layers });
+    }
+    ridesRaf = requestAnimationFrame(ridesTick);
+  };
+  const ensureRidesAnimating = () => {
+    if (ridesRaf) return;
+    if (!store.show_rides.get()) return;
+    if (!Object.keys(store.transition_topk.get() || {}).length) return;
+    ridesRaf = requestAnimationFrame(ridesTick);
+  };
+  store.show_rides.subscribe(() => ensureRidesAnimating(), { immediate: false });
+  store.transition_topk.subscribe(() => ensureRidesAnimating(), { immediate: false });
   const syncFromModel = () => {
     const ci = JSON.stringify(model.get("click_info") || {});
     const rows = JSON.stringify(model.get("selected_rows") || []);
@@ -46390,6 +46948,11 @@ function render({ model, el }) {
     store.alpha_index.set(Number.isFinite(ai) ? ai | 0 : 4);
     store.show_neighborhoods.set(Boolean(model.get("show_neighborhoods") ?? true));
     store.show_stations.set(Boolean(model.get("show_stations") ?? true));
+    store.show_rides.set(Boolean(model.get("show_rides") ?? true));
+    const tk = model.get("transition_topk") || {};
+    store.transition_topk.set(tk && typeof tk === "object" ? tk : {});
+    const so = model.get("station_outflow") || {};
+    store.station_outflow.set(so && typeof so === "object" ? so : {});
     log3(store, "syncFromModel done", {
       linkSeq: linkInteractionSeq,
       rows: (store.selected_rows.get() || []).length,
@@ -46416,7 +46979,10 @@ function render({ model, el }) {
     "cluster_polygons",
     "alpha_index",
     "show_neighborhoods",
-    "show_stations"
+    "show_stations",
+    "show_rides",
+    "transition_topk",
+    "station_outflow"
   ].forEach((name2) => model.on(`change:${name2}`, syncFromModel));
   model.on("change:cg_row_names", () => scheduleRender());
   model.on("change:cg_col_names", () => scheduleRender());
@@ -46424,6 +46990,7 @@ function render({ model, el }) {
   return () => {
     clearTimeout(hoverTimer);
     if (raf) cancelAnimationFrame(raf);
+    if (ridesRaf) cancelAnimationFrame(ridesRaf);
     if (deck) deck.finalize();
   };
 }

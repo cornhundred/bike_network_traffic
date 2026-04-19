@@ -36,3 +36,23 @@ class BikeFlowMapWidget(anywidget.AnyWidget):
     # UI toggles surfaced as buttons in the widget control panel.
     show_neighborhoods = traitlets.Bool(True).tag(sync=True)
     show_stations = traitlets.Bool(True).tag(sync=True)
+    show_rides = traitlets.Bool(True).tag(sync=True)
+
+    # Sparse top-K destination distribution per origin station. The JS-side
+    # ride simulator samples from this to animate ~1000 simultaneous bike
+    # rides on the map. Format::
+    #
+    #   {origin_name: [[dest_name, weight], ...]}
+    #
+    # Weights are raw probabilities (0..1) summed over the kept K
+    # destinations; the JS sampler renormalizes to a CDF. See
+    # ``viz.compute_transition_topk``.
+    transition_topk = traitlets.Dict(default_value={}).tag(sync=True)
+    # Per-station total outflow (raw trip counts originating at each
+    # station). Used by the JS ride simulator to weight the initial
+    # ~1000-bike seed and the rebalancing teleport target so busy
+    # departure hubs get proportionally more bikes — matching how
+    # bike-share organizations physically redistribute. Empty dict means
+    # the JS side will fall back to the chain's stationary distribution.
+    # Format: ``{station_name: int_count}``.
+    station_outflow = traitlets.Dict(default_value={}).tag(sync=True)

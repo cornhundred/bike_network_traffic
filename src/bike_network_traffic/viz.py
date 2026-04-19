@@ -25,11 +25,82 @@ if TYPE_CHECKING:
     import pandas as pd
 
 __all__ = [
+    "compute_station_outflow",
+    "compute_transition_topk",
     "flat_clusters_from_matrix",
     "make_station_clustergram",
     "make_flow_widget",
     "link_flow_to_clustergram",
 ]
+
+
+def compute_station_outflow(
+    trips: "pd.DataFrame",
+    *,
+    station_col: str = "start_station_name",
+) -> dict[str, int]:
+    """Per-station outflow counts (number of trips originating at each station).
+
+    Returned as ``{station_name: int_count}`` and shipped to the JS-side
+    ride simulator so the initial ~1000-bike seed and the rebalancing
+    teleport target are weighted by *true* trip volume rather than the
+    stationary-distribution approximation used when raw trips are
+    unavailable.
+    """
+    if trips is None or len(trips) == 0:
+        return {}
+    grouped = trips.dropna(subset=[station_col]).groupby(station_col).size()
+    return {str(name): int(count) for name, count in grouped.items()}
+
+
+def compute_transition_topk(
+    transition_prob: "pd.DataFrame",
+    k: int = 50,
+    *,
+    min_weight: float = 1e-4,
+) -> dict[str, list[list]]:
+    """Sparse top-K destination distribution per origin station.
+
+    Returned shape is ``{origin_name: [[dest_name, weight], ...]}`` with each
+    list sorted by descending weight, truncated at ``k``, and filtered to
+    entries with ``weight >= min_weight``. The JS-side ride simulator
+    renormalizes the kept entries to a CDF for sampling and uses them as
+    the transition kernel of a markov-chain random walk: each "ride" hops
+    from station to station, sampling its next destination from the
+    current station's distribution. K=50 gives the walk enough variety
+    that rides don't get stuck oscillating between two popular endpoints,
+    while keeping the wire payload to a few MB before gzip (well within
+    what static HTML embeds can carry).
+    """
+    import numpy as np
+
+    out: dict[str, list[list]] = {}
+    if transition_prob is None or len(transition_prob) == 0:
+        return out
+    # `transition_prob` is column-normalized: rows are destinations,
+    # columns are origins, and each *column* sums to 1.0. So for each
+    # origin (column j) we collect the top-K destinations (row indices
+    # with the largest column-j values).
+    dests = transition_prob.index.astype(str).to_numpy()
+    arr = transition_prob.to_numpy()
+    keep = max(1, int(k))
+    for j, origin in enumerate(transition_prob.columns.astype(str)):
+        col = arr[:, j]
+        if not np.any(col > 0):
+            continue
+        if col.size > keep:
+            top_ix = np.argpartition(col, -keep)[-keep:]
+            top_ix = top_ix[np.argsort(-col[top_ix])]
+        else:
+            top_ix = np.argsort(-col)
+        entries = [
+            [str(dests[i]), float(col[i])]
+            for i in top_ix
+            if float(col[i]) >= min_weight
+        ]
+        if entries:
+            out[str(origin)] = entries
+    return out
 
 
 def flat_clusters_from_matrix(mat: Any, n_clusters: int = 20) -> dict[str, int]:
@@ -153,6 +224,7 @@ def make_flow_widget(
     transition_prob: "pd.DataFrame",
     cluster_map: dict[str, int] | None = None,
     *,
+    trips: "pd.DataFrame | None" = None,
     width: int = 560,
     height: int = 700,
     palette: list[str] | None = None,
@@ -220,6 +292,14 @@ def make_flow_widget(
         for r in coord_df.itertuples()
     ]
     flow.edge_index = {}
+    flow.transition_topk = compute_transition_topk(transition_prob)
+    # If raw trips were passed through, ship per-station outflow counts
+    # so the JS ride simulator can weight bikes by true trip volume
+    # instead of approximating with the markov chain's stationary
+    # distribution. Backward-compatible: missing trips just leaves the
+    # dict empty and JS falls back to the approximation.
+    if trips is not None:
+        flow.station_outflow = compute_station_outflow(trips)
 
     levels = nbhd_levels_miles or DEFAULT_LEVELS_MILES
     flow.cluster_polygons = compute_cluster_alpha_shapes(

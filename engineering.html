@@ -148,10 +148,11 @@
     <li><a href="#linkage">4. Clustergram &rarr; map linkage</a></li>
     <li><a href="#store">5. Observable store on the JS side</a></li>
     <li><a href="#layers">6. deck.gl layer stack &amp; picking</a></li>
-    <li><a href="#nbhd">7. Alpha-shape neighborhoods</a></li>
-    <li><a href="#umap">8. Spatial &harr; UMAP morph</a></li>
-    <li><a href="#static">9. Building the static HTMLs</a></li>
-    <li><a href="#future">10. Known limits &amp; future work</a></li>
+    <li><a href="#rides">7. Animated bike-ride simulation</a></li>
+    <li><a href="#nbhd">8. Alpha-shape neighborhoods</a></li>
+    <li><a href="#umap">9. Spatial &harr; UMAP morph</a></li>
+    <li><a href="#static">10. Building the static HTMLs</a></li>
+    <li><a href="#future">11. Known limits &amp; future work</a></li>
   </ul>
 </nav>
 
@@ -401,13 +402,22 @@
       <strong>alpha-shape polygons</strong> (<code>PolygonLayer</code>) &mdash; one ring
       per cluster, stroked + filled. Border carries the emphasis (width &rarr; 3.2 px and
       alpha &rarr; 245 when hovered or pinned); fill stays light so station dots inside
-      stay readable. See <a href="#nbhd">§7</a>.
+      stay readable. See <a href="#nbhd">§8</a>.
     </li>
     <li>
       <strong>flow lines</strong> (<code>LineLayer</code>) &mdash; the user&apos;s current
       <code>edges</code> array. Width is proportional to <code>sqrt(probability)</code>;
       color depends on direction (red = outbound, blue = inbound, near-black = a single
       <code>mat_value</code> cell click so it reads against any basemap).
+    </li>
+    <li>
+      <strong>animated rides</strong> (<code>ScatterplotLayer</code>) &mdash; a swarm of
+      tiny dots taking a Markov-chain random walk over the station network, colored by
+      their current origin&apos;s cluster. Inserted just below the station scatter so
+      stations stay clickable. Pool size scales with the city &mdash; roughly 2&times;
+      the station count, capped at 5000 (so NYC gets ~4000, Chicago ~1800, DC ~1400,
+      Boston ~800). On by default; the <em>Rides</em> button in the top bar toggles
+      visibility. See <a href="#rides">§7</a> for the full pipeline.
     </li>
     <li>
       <strong>station scatter</strong> (<code>ScatterplotLayer</code>) &mdash; one dot per
@@ -424,8 +434,239 @@
   </p>
 </section>
 
+<section id="rides">
+  <h2>7. Animated bike-ride simulation</h2>
+  <p>
+    With the static map in place it&apos;s easy to forget you&apos;re looking at a
+    living system. By default the map drops a swarm of tiny dots onto the network &mdash;
+    each one taking a random walk over the station graph in real time &mdash; and the
+    <em>Rides</em> button in the top bar toggles them off if you want a static view. The
+    whole simulation runs client-side (the kernel is never involved past the initial
+    data push) and reacts instantly to focus changes and the spatial&harr;UMAP morph.
+  </p>
+
+  <h3>Data shipped from Python</h3>
+  <p>
+    Two new traitlets carry everything the JS sampler needs:
+  </p>
+<pre>transition_topk = traitlets.Dict({}).tag(sync=True)
+station_outflow = traitlets.Dict({}).tag(sync=True)</pre>
+  <ul>
+    <li>
+      <code>transition_topk</code>: a sparse top-<em>K</em> (K=50) view of the
+      destination-probability matrix. Format
+      <code>{origin_name: [[dest_name, weight], &hellip;]}</code>. Built by
+      <code>viz.compute_transition_topk</code> by walking each <em>column</em> of the
+      column-normalized matrix (columns are origins) and keeping the K largest
+      destinations with weight &ge; 1e-4. For NYC&apos;s ~2&apos;000 stations &times; 50
+      neighbors that&apos;s well under 500 KB of JSON.
+    </li>
+    <li>
+      <code>station_outflow</code>: raw per-station trip counts straight from the trips
+      DataFrame, computed by <code>viz.compute_station_outflow(trips)</code>. Optional
+      &mdash; only populated when the user passed
+      <code>get_bike_data(&hellip;, return_trips=True)</code> through to
+      <code>make_flow_widget(&hellip;, trips=trips)</code>. Used to weight initial bike
+      placement by real volume; when missing, the JS side falls back to an approximation
+      (see below).
+    </li>
+  </ul>
+
+  <h3>The sampler</h3>
+  <p>
+    <code>makeRideSampler(transitionTopk, stationOutflow)</code> builds three things up
+    front, all at sampler-creation time so each frame is just a few CDF lookups:
+  </p>
+  <ol>
+    <li>
+      A per-origin <strong>cumulative distribution</strong> over its top-K destinations,
+      stored as parallel <code>dests[]</code> / <code>cum[]</code> arrays so a single
+      <code>Math.random() * total</code> + linear scan picks the next station in O(K).
+    </li>
+    <li>
+      A <strong>volume distribution</strong> <em>w</em> over origins, used both to seed
+      the initial pool and to drive teleports (next bullet). When
+      <code>station_outflow</code> is present, <em>w</em> = raw outflow counts &mdash;
+      the ground truth for &ldquo;where rides start&rdquo;. When it&apos;s absent we
+      approximate by <strong>power-iterating the chain&apos;s stationary distribution</strong>
+      &pi; = <em>P</em>&middot;&pi; for 30 steps over the sparse top-K kernel; that
+      naturally concentrates mass on busy hubs but is slightly biased by the top-K
+      truncation.
+    </li>
+    <li>
+      A <strong>teleport CDF</strong> derived from <em>w</em>, restricted to stations
+      that also have an outgoing entry so a teleport never lands on a dead-end.
+    </li>
+  </ol>
+  <p>
+    Each Markov step rolls a uniform first: with probability
+    <code>RIDE_TELEPORT_PROB = 0.05</code> the rider ignores the local distribution and
+    teleports to a station drawn from the volume distribution. This is a PageRank-style
+    move, and it captures the truck-and-van rebalancing that bike-share operators do
+    every night &mdash; without it, walkers can spend many steps shuffling between a
+    handful of nearby outer-borough stations because the column-normalized
+    <code>transition_prob</code> has lost absolute trip volume.
+  </p>
+
+  <h3>The pool and the loop</h3>
+  <p>
+    The simulation is a <code>ridesPool</code> of ride objects, each:
+  </p>
+<pre>{
+  from_name, to_name,        // current segment
+  t,                          // progress in [0, 1]
+  duration,                   // ms; scales with great-circle distance + jitter
+  color,                      // RGB tinted by from-cluster
+  position,                   // [lng, lat], lerped each frame
+  focused?,                   // see "Focused mode" below
+}</pre>
+  <p>
+    A dedicated <code>requestAnimationFrame</code> loop (<code>ridesTick</code>) advances
+    every ride by the inter-frame &Delta;<em>t</em> and recomputes its
+    <code>position</code> by linear interpolation in the <em>current</em>
+    <code>posLookup</code>. That last detail is what makes rides ride along with the
+    spatial&harr;UMAP morph &mdash; the same dot smoothly slides from its
+    geographic-space lerp to its UMAP-space lerp as the slider moves, without any
+    knowledge of either coordinate system in the ride object itself.
+  </p>
+  <p>
+    When <code>t &ge; 1</code> the ride takes a Markov step: <code>from_name</code>
+    becomes the old <code>to_name</code>, <code>sampleNext()</code> picks a new
+    destination, and <code>duration</code> is recomputed from the new geography.
+    Overshoot (<code>t - 1</code>) is carried into the new segment so steady-state
+    isn&apos;t biased by snap-to-zero on each hop. Color re-tints to the new origin&apos;s
+    cluster so dots visibly pick up local color as they cross neighborhood boundaries.
+  </p>
+
+  <h3>Decoupling from the main render pipeline</h3>
+  <p>
+    The first version of this hooked the rides into <code>scheduleRender()</code>, and
+    immediately killed hover/click responsiveness: a 60 Hz rAF was forcing the whole
+    layer stack (basemap + polygons + flow lines + stations) to rebuild every frame,
+    starving picking events. The fix splits the pipeline:
+  </p>
+  <ul>
+    <li>
+      <code>buildLayers()</code> still produces the four non-rides layers, and caches
+      them in <code>cachedNonRidesLayers</code>. It also refreshes a small
+      <code>ridesCtx</code> object (<code>posLookup</code>, palette, cluster lookup,
+      spatial mix, focus, focusCtx).
+    </li>
+    <li>
+      <code>ridesTick</code> never re-runs <code>computeStateFromInputs()</code> or
+      rebuilds non-rides layers. Each frame it advances the pool, builds <em>only</em>
+      the rides <code>ScatterplotLayer</code>, splices it into
+      <code>cachedNonRidesLayers</code> just below the station scatter, and pushes the
+      result via <code>deck.setProps({ layers })</code>. Hover and click handlers run
+      against stable layer instances, so picking stays smooth even at 60 fps.
+    </li>
+  </ul>
+  <p>
+    The <code>ScatterplotLayer</code> uses an integer <code>ridesFrame</code> counter as
+    its <code>updateTriggers.getPosition</code>, so deck.gl re-runs the position
+    accessor every frame while leaving the rest of the layer&apos;s GPU state alone.
+  </p>
+
+  <h3>Focused modes</h3>
+  <p>
+    Any selection in the UI &mdash; a station click on the map, a row/col label or
+    dendrogram pick on the clustergram, or a single matrix cell &mdash; switches the
+    rides simulator out of the ambient Markov walk into a one-shot mode tailored to
+    that selection. <code>computeStateFromInputs</code> tags each selection with a
+    <code>kind</code> (<code>'station'</code>, <code>'mat_cell'</code>,
+    <code>'col_dendro'</code>, <code>'row_dendro'</code>, <code>'cat_value'</code>) and
+    <code>buildFocusedRideContext(...)</code> dispatches on it:
+  </p>
+  <ul>
+    <li>
+      <strong>station</strong> &mdash; in/out CDFs over the focused station&apos;s top
+      neighbours, drawn straight from <code>store.edges</code> (so the rides match
+      exactly what the line layer is showing). Direction is rolled per ride against
+      total in vs out mass, so a station with mostly inbound trips visually gets mostly
+      inbound animations.
+    </li>
+    <li>
+      <strong>mat_cell</strong> &mdash; a single fixed (origin &rarr; destination) pair.
+      Every ride is the same trip; useful for &ldquo;watch how often this specific flow
+      fires&rdquo; once you&apos;ve clicked a cell in the clustergram heatmap.
+    </li>
+    <li>
+      <strong>col_dendro</strong> / <strong>cat_value</strong> &mdash; <em>outgoing</em>
+      rides from any station in the dendrogram or category selection. Per ride: pick an
+      origin from the selection (weighted by <code>station_outflow</code> when shipped,
+      else uniform), then sample its destination from <code>transition_topk</code>.
+    </li>
+    <li>
+      <strong>row_dendro</strong> &mdash; <em>incoming</em> rides to any station in the
+      selection. We invert <code>transition_topk</code> over the selected destinations
+      once at context-construction time to build a per-destination incoming CDF, then
+      per ride: pick a destination (weighted by total inflow into the selection), then
+      pick an origin from that destination&apos;s incoming CDF.
+    </li>
+  </ul>
+  <p>
+    Each focused ride is tagged <code>focused: true</code>; <code>advanceRides</code>
+    checks the flag and retires the ride on segment completion
+    (<code>pool[i] = null</code>) instead of taking another Markov step.
+    <code>refillRides</code> immediately spawns a replacement &mdash; the pool stays
+    full but <em>chain continuation is disabled</em> in every focused mode.
+  </p>
+  <p>
+    The pool also <em>shrinks</em> when entering focused mode:
+    <code>targetRidesPoolSize(numStations, focused = true)</code> returns
+    <code>~10%</code> of the ambient size (with a floor of 50), so the simulation
+    doesn&apos;t drown out the line geometry when restricted to a single station&apos;s
+    neighbourhood, a single cell&apos;s flow, or a small dendro selection. NYC drops
+    from ~4000 to ~400 walkers; Boston from ~800 to ~80 (clamped to 50 minimum).
+  </p>
+  <p>
+    Switching between selections (or back to ambient) flushes the pool via
+    <code>flushRidesForSelectionChange</code>, which keys off a signature built from
+    the kind plus the relevant identifiers (focused station name, mat-cell pair,
+    dendro selection set). Same selection reissued under a new
+    <code>linkInteractionSeq</code> doesn&apos;t flicker; an actual change immediately
+    swaps the swarm.
+  </p>
+
+  <h3>Tuning knobs</h3>
+  <ul>
+    <li>
+      <strong>Pool size</strong> &mdash; computed per-city by
+      <code>targetRidesPoolSize(numStations, focused)</code>.
+      <em>Ambient</em> is <code>clamp(round(RIDES_PER_STATION &times; numStations), 400, 5000)</code>
+      &mdash; NYC ~4000, Chicago ~1800, DC ~1400, Boston ~800. <em>Focused</em>
+      (any station / cell / dendro / cat selection) drops to
+      <code>RIDES_FOCUSED_FRACTION = 0.10</code> of ambient, floored at
+      <code>RIDES_FOCUSED_MIN = 50</code>. <code>resizeRidesPool</code> grows or trims
+      the pool in place on every selection change. Higher <code>RIDES_PER_STATION</code>
+      feels denser but costs CPU on the per-frame interpolation loop &mdash; the cap of
+      5000 keeps even NYC under a few ms per frame.
+    </li>
+    <li>
+      <code>RIDE_TELEPORT_PROB = 0.05</code> &mdash; balance between local realism (low)
+      and rebalancing-toward-hubs (high). 0.15 felt too jumpy; 0.0 traps walkers in
+      outer-borough cycles.
+    </li>
+    <li>
+      <code>RIDE_MS_PER_DEG</code> &mdash; constant velocity, in milliseconds per degree
+      of (lng, lat) distance. We use a constant-velocity model so every dot covers the
+      same on-screen speed regardless of hop length: a short adjacent-station hop
+      finishes quickly, a cross-town hop takes proportionally longer, and the visual
+      flow speed stays consistent across the whole map.
+      <code>RIDE_SEG_VEL_JITTER</code> applies a small (&plusmn;18%) multiplicative
+      jitter on the velocity so dots in the same wave don&apos;t arrive in lockstep,
+      and <code>RIDE_SEG_MIN_MS</code> guards against zero-length segments (co-located
+      stations) becoming instantaneous.
+    </li>
+    <li>
+      Dot radius (<code>getRadius: 1.3</code>, min 0.8 px / max 2.2 px) &mdash; small
+      enough that 1000 simultaneous rides don&apos;t overwhelm the station scatter.
+    </li>
+  </ul>
+</section>
+
 <section id="nbhd">
-  <h2>7. Alpha-shape neighborhoods</h2>
+  <h2>8. Alpha-shape neighborhoods</h2>
   <p>
     The polygons come from <code>celldega.nbhd.alpha_shape</code>, which is a thin
     wrapper over <code>libpysal</code>&apos;s alpha-shape implementation. Input is a
@@ -482,7 +723,7 @@
 </section>
 
 <section id="umap">
-  <h2>8. Spatial &harr; UMAP morph</h2>
+  <h2>9. Spatial &harr; UMAP morph</h2>
   <p>
     Each station ships with both a <code>(lng, lat)</code> pair and a
     <code>(umap_lng, umap_lat)</code> pair (centered on the geographic centroid so the
@@ -511,7 +752,7 @@ for (const s of stations) {
 </section>
 
 <section id="static">
-  <h2>9. Building the static HTMLs</h2>
+  <h2>10. Building the static HTMLs</h2>
   <p>
     Two notebook-driven pipelines produce the artifacts shipped alongside
     <code>index.html</code>:
@@ -542,7 +783,7 @@ for (const s of stations) {
 </section>
 
 <section id="future">
-  <h2>10. Known limits &amp; future work</h2>
+  <h2>11. Known limits &amp; future work</h2>
   <ul>
     <li>
       <strong>No Clustergram hover linkage.</strong> Celldega&apos;s Clustergram keeps
@@ -561,10 +802,13 @@ for (const s of stations) {
       a fixed seed or a saved embedding to stabilize publication-quality outputs.
     </li>
     <li>
-      <strong>Flow lines cap at top-<em>k</em>.</strong> The map asks the Clustergram
-      for a top-25 slice by design &mdash; a dense city can easily have 200+ non-trivial
-      targets from a single station. A &ldquo;show all&rdquo; mode with
-      <code>ArcLayer</code> and alpha-by-probability would be a nice addition.
+      <strong>Flow lines cap at top-30.</strong> The map asks the Clustergram for a
+      top-30 slice on station click (<code>MAP_STATION_SLICE_TOP_K</code>) and lets the
+      simulated rides carry the long-tail signal visually &mdash; bumping the cap
+      higher quickly turns Manhattan hubs into spaghetti. An alternate
+      <code>ArcLayer</code> rendering for arched cross-town flows, or a &ldquo;show
+      all&rdquo; mode that fades sub-pixel edges by probability, would let us push the
+      cap up without sacrificing readability.
     </li>
     <li>
       <strong>Widget-only HTML is ~1.5 MB</strong> per city, dominated by the deck.gl +
