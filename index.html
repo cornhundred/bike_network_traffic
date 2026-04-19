@@ -92,6 +92,14 @@
   }
 
   .embed {
+    /* The widget HBox inside the iframe is 560px (flow) + 720px (cgm) = 1280px.
+       `main` is capped at 1300px - 64px padding = 1236px, which clips the right
+       slider. Let the embed break out to a wider container while keeping the
+       rest of the page at a readable prose width. */
+    width: min(1380px, calc(100vw - 32px));
+    position: relative;
+    left: 50%;
+    transform: translateX(-50%);
     margin: 24px 0 8px;
     border: 1px solid var(--border);
     border-radius: 12px;
