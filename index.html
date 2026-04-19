@@ -92,14 +92,6 @@
   }
 
   .embed {
-    /* The widget HBox inside the iframe is 560px (flow) + 720px (cgm) = 1280px.
-       `main` is capped at 1300px - 64px padding = 1236px, which clips the right
-       slider. Let the embed break out to a wider container while keeping the
-       rest of the page at a readable prose width. */
-    width: min(1380px, calc(100vw - 32px));
-    position: relative;
-    left: 50%;
-    transform: translateX(-50%);
     margin: 24px 0 8px;
     border: 1px solid var(--border);
     border-radius: 12px;
@@ -211,9 +203,9 @@
     it as a Celldega clustergram linked to a deck.gl map of the stations.
   </p>
   <p>
-    The two views are <strong>bidirectionally linked in the browser</strong>: hovering or
-    selecting on the heatmap highlights the corresponding stations on the map; clicking or
-    box-selecting on the map slices the matrix. A slider morphs the map between geographic
+    The two views are <strong>linked in the browser</strong>: hovering, selecting, or slicing
+    on the Clustergram drives the map — focused stations, top-trip lines, and matching
+    neighborhoods light up while the rest dim. A slider morphs the map between geographic
     coordinates and a UMAP embedding of the transition matrix, so behavioral neighborhoods
     (commute corridors, leisure routes) emerge from the geographic backdrop.
   </p>

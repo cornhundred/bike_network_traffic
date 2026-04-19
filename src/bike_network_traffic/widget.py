@@ -27,3 +27,12 @@ class BikeFlowMapWidget(anywidget.AnyWidget):
     cg_row_names = traitlets.List(default_value=[]).tag(sync=True)
     cg_col_names = traitlets.List(default_value=[]).tag(sync=True)
     spatial_mix = traitlets.Float(0.0).tag(sync=True)
+
+    # Per-cluster alpha-shape neighborhoods. See ``nbhd.compute_cluster_alpha_shapes``
+    # for the wire format. Empty dict disables the neighborhood layer entirely.
+    cluster_polygons = traitlets.Dict(default_value={}).tag(sync=True)
+    # Index into ``cluster_polygons["levels_miles"]``. Driven by the resolution slider.
+    alpha_index = traitlets.Int(4).tag(sync=True)
+    # UI toggles surfaced as buttons in the widget control panel.
+    show_neighborhoods = traitlets.Bool(True).tag(sync=True)
+    show_stations = traitlets.Bool(True).tag(sync=True)

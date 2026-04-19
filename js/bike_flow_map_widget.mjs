@@ -1,4 +1,11 @@
-import { BitmapLayer, Deck, LineLayer, ScatterplotLayer, TileLayer } from 'deck.gl';
+import {
+  BitmapLayer,
+  Deck,
+  LineLayer,
+  PolygonLayer,
+  ScatterplotLayer,
+  TileLayer,
+} from 'deck.gl';
 
 const Observable = (initialValue) => {
   let value = initialValue;
@@ -36,6 +43,15 @@ const createStore = () => ({
   matrix_axis_slice: Observable({}),
   spatial_mix: Observable(0),
   hovered_cluster: Observable(null),
+  // Pre-computed alpha-shape neighborhoods keyed by cluster_id, sliced by alpha_index.
+  // See nbhd.compute_cluster_alpha_shapes for the wire format.
+  cluster_polygons: Observable({ levels_miles: [], polygons: [] }),
+  alpha_index: Observable(4),
+  show_neighborhoods: Observable(true),
+  show_stations: Observable(true),
+  // Persistent "pinned" cluster — survives slider changes, cluster-resolution
+  // tweaks, mouse leaves. Toggled by clicking an NBHD polygon.
+  pinned_cluster: Observable(null),
 });
 
 const log = (store, ...args) => {
@@ -239,47 +255,167 @@ function fitViewState(stations) {
 
 function render({ model, el }) {
   const store = createStore();
+
+  // Layout: vertical stack with a thin top toolbar above the deck.gl canvas.
+  // Keeping controls *outside* the canvas (rather than overlaid on it) means
+  // hovering or dragging the sliders can't drive the map's pointer state, and
+  // it mirrors the toolbar pattern used by the Celldega widgets.
   const root = document.createElement('div');
-  root.style.background = '#e2e4e8';
-  root.style.borderRadius = '4px';
-  root.style.overflow = 'hidden';
-  root.style.position = 'relative';
+  root.style.cssText =
+    'background:#e2e4e8;border-radius:4px;overflow:hidden;display:flex;flex-direction:column;';
   el.appendChild(root);
 
-  const controlPanel = document.createElement('div');
-  controlPanel.style.cssText =
-    'position:absolute;top:10px;right:10px;background:rgba(255,255,255,0.92);' +
-    'padding:8px 14px;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,0.15);' +
-    'z-index:1;font:12px system-ui,sans-serif;user-select:none;display:none;';
-  const sliderLabel = document.createElement('div');
-  sliderLabel.style.cssText = 'margin-bottom:4px;color:#444;font-weight:500;';
-  sliderLabel.textContent = 'Spatial \u2194 UMAP';
+  const TOPBAR_HEIGHT = 38;
+  const topbar = document.createElement('div');
+  topbar.style.cssText =
+    'flex:0 0 auto;height:' + TOPBAR_HEIGHT + 'px;box-sizing:border-box;' +
+    'display:flex;align-items:center;gap:14px;padding:0 12px;' +
+    'background:#f5f6f8;border-bottom:1px solid #d0d3d8;' +
+    'font:12px system-ui,sans-serif;color:#333;user-select:none;';
+  root.appendChild(topbar);
+
+  const mapHolder = document.createElement('div');
+  mapHolder.style.cssText =
+    'flex:1 1 auto;position:relative;background:#e2e4e8;transition:background-color 200ms;';
+  root.appendChild(mapHolder);
+
+  const styleToggleButton = (btn, on) => {
+    btn.style.background = on ? '#1f77b4' : '#fff';
+    btn.style.color = on ? '#fff' : '#444';
+    btn.style.borderColor = on ? '#1f77b4' : '#ccc';
+  };
+
+  const makeToggle = (label, observable, modelKey) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = label;
+    btn.style.cssText =
+      'padding:3px 10px;border:1px solid #ccc;border-radius:4px;' +
+      'background:#fff;color:#444;font:inherit;cursor:pointer;transition:all 0.18s;';
+    styleToggleButton(btn, observable.get());
+    btn.addEventListener('click', () => {
+      const next = !observable.get();
+      observable.set(next);
+      styleToggleButton(btn, next);
+      if (modelKey) {
+        model.set(modelKey, next);
+        model.save_changes();
+      }
+      scheduleRender();
+    });
+    observable.subscribe((v) => styleToggleButton(btn, v), { immediate: false });
+    return btn;
+  };
+
+  const toggleGroup = document.createElement('div');
+  toggleGroup.style.cssText = 'display:flex;gap:6px;flex:0 0 auto;';
+  toggleGroup.appendChild(makeToggle('NBHD', store.show_neighborhoods, 'show_neighborhoods'));
+  toggleGroup.appendChild(makeToggle('Stations', store.show_stations, 'show_stations'));
+  topbar.appendChild(toggleGroup);
+
+  // Vertical divider so toolbar groups read as distinct.
+  const divider = () => {
+    const d = document.createElement('div');
+    d.style.cssText = 'width:1px;align-self:stretch;background:#d0d3d8;margin:6px 0;';
+    return d;
+  };
+  topbar.appendChild(divider());
+
+  // Spatial <-> UMAP morph slider (only shown when stations have UMAP coords).
+  const spatialBlock = document.createElement('div');
+  spatialBlock.style.cssText = 'display:flex;align-items:center;gap:8px;flex:1 1 auto;min-width:0;';
+  const spatialLabel = document.createElement('span');
+  spatialLabel.style.cssText = 'color:#444;font-weight:500;white-space:nowrap;';
+  spatialLabel.textContent = 'Spatial \u2194 UMAP';
   const slider = document.createElement('input');
   slider.type = 'range';
   slider.min = '0';
   slider.max = '1';
   slider.step = '0.01';
   slider.value = '0';
-  slider.style.cssText = 'width:140px;cursor:pointer;';
+  slider.style.cssText = 'flex:1 1 auto;min-width:60px;cursor:pointer;';
   slider.addEventListener('input', () => {
     const t = parseFloat(slider.value);
     store.spatial_mix.set(t);
     model.set('spatial_mix', t);
     model.save_changes();
   });
-  controlPanel.appendChild(sliderLabel);
-  controlPanel.appendChild(slider);
-  for (const evt of ['pointerdown', 'pointermove', 'pointerup', 'wheel', 'dblclick']) {
-    controlPanel.addEventListener(evt, (e) => e.stopPropagation());
-  }
-  root.appendChild(controlPanel);
+  spatialBlock.appendChild(spatialLabel);
+  spatialBlock.appendChild(slider);
+  topbar.appendChild(spatialBlock);
 
+  let umapDividerEl = null;
   store.stations.subscribe((stations) => {
     const hasUmap = stations.some((s) => s.umap_lng != null && s.umap_lat != null);
-    controlPanel.style.display = hasUmap ? 'block' : 'none';
+    spatialBlock.style.display = hasUmap ? 'flex' : 'none';
+    if (umapDividerEl) umapDividerEl.style.display = hasUmap ? 'block' : 'none';
   }, { immediate: true });
 
-  root.addEventListener('mouseleave', () => {
+  umapDividerEl = divider();
+  topbar.appendChild(umapDividerEl);
+
+  // Alpha-shape resolution slider. Index into cluster_polygons.levels_miles.
+  // Hidden when no neighborhoods are precomputed.
+  const nbhdBlock = document.createElement('div');
+  nbhdBlock.style.cssText = 'display:flex;align-items:center;gap:8px;flex:1 1 auto;min-width:0;';
+  const nbhdLabel = document.createElement('span');
+  nbhdLabel.style.cssText = 'color:#444;font-weight:500;white-space:nowrap;';
+  nbhdLabel.textContent = 'NBHD radius';
+  const nbhdSlider = document.createElement('input');
+  nbhdSlider.type = 'range';
+  nbhdSlider.min = '0';
+  nbhdSlider.max = '0';
+  nbhdSlider.step = '1';
+  nbhdSlider.value = '0';
+  nbhdSlider.style.cssText = 'flex:1 1 auto;min-width:60px;cursor:pointer;';
+  const nbhdValue = document.createElement('span');
+  nbhdValue.style.cssText =
+    'color:#666;font-variant-numeric:tabular-nums;min-width:54px;text-align:right;white-space:nowrap;';
+  const formatMiles = (mi) => (mi < 0.1 ? `${(mi * 5280).toFixed(0)} ft` : `${mi.toFixed(2)} mi`);
+  const refreshNbhdSlider = () => {
+    const cp = store.cluster_polygons.get() || {};
+    const levels = Array.isArray(cp.levels_miles) ? cp.levels_miles : [];
+    if (!levels.length) {
+      nbhdBlock.style.display = 'none';
+      return;
+    }
+    nbhdBlock.style.display = 'flex';
+    nbhdSlider.max = String(levels.length - 1);
+    const idx = Math.max(0, Math.min(levels.length - 1, store.alpha_index.get() | 0));
+    nbhdSlider.value = String(idx);
+    nbhdValue.textContent = formatMiles(Number(levels[idx]) || 0);
+  };
+  nbhdSlider.addEventListener('input', () => {
+    const idx = parseInt(nbhdSlider.value, 10) | 0;
+    store.alpha_index.set(idx);
+    refreshNbhdSlider();
+    model.set('alpha_index', idx);
+    model.save_changes();
+    scheduleRender();
+  });
+  nbhdBlock.appendChild(nbhdLabel);
+  nbhdBlock.appendChild(nbhdSlider);
+  nbhdBlock.appendChild(nbhdValue);
+  topbar.appendChild(nbhdBlock);
+  store.cluster_polygons.subscribe(refreshNbhdSlider, { immediate: true });
+  store.alpha_index.subscribe(refreshNbhdSlider, { immediate: false });
+  store.show_neighborhoods.subscribe((on) => {
+    nbhdBlock.style.opacity = on ? '1' : '0.4';
+    nbhdSlider.disabled = !on;
+  }, { immediate: true });
+
+  // Map background fades from the basemap-matched grey toward pure white as we
+  // morph into UMAP space (where the basemap tiles fade out and a flat white
+  // canvas reads cleaner).
+  store.spatial_mix.subscribe((mix) => {
+    const t = Math.max(0, Math.min(1, Number(mix) || 0));
+    const r = Math.round(226 + (255 - 226) * t);
+    const g = Math.round(228 + (255 - 228) * t);
+    const b = Math.round(232 + (255 - 232) * t);
+    mapHolder.style.background = `rgb(${r},${g},${b})`;
+  }, { immediate: true });
+
+  mapHolder.addEventListener('mouseleave', () => {
     clearTimeout(hoverTimer);
     if (store.hovered_cluster.get() != null) {
       store.hovered_cluster.set(null);
@@ -601,6 +737,35 @@ function render({ model, el }) {
     const hasSel = Boolean(focus) || highlights.size > 0;
     const spatialMix = store.spatial_mix.get();
     const hoveredCluster = store.hovered_cluster.get();
+    const pinnedCluster = store.pinned_cluster.get();
+    // Set of cluster ids whose neighborhood should be visually emphasized
+    // (highlighted polygon + station-dim). Priority:
+    //   1. pinned cluster (click-pinned NBHD, persists across renders),
+    //   2. direct station / NBHD hover (`hovered_cluster` = single id),
+    //   3. active `highlights` selection (cat_value, mat_value cell linking
+    //      two stations, dendrogram pick, ...). Multiple clusters can be
+    //      active at once when e.g. a matrix cell links two clusters.
+    const derivedClusters = new Set();
+    if (pinnedCluster != null && pinnedCluster !== 0) {
+      derivedClusters.add(pinnedCluster);
+    }
+    if (hoveredCluster != null && hoveredCluster !== 0) {
+      derivedClusters.add(hoveredCluster);
+    }
+    if (derivedClusters.size === 0 && highlights.size > 0) {
+      const stationCluster = new Map();
+      for (const s of stations) stationCluster.set(s.name, s.cluster_id);
+      for (const n of highlights) {
+        const cid = stationCluster.get(n);
+        if (cid != null && cid !== 0) derivedClusters.add(cid);
+      }
+    }
+    const hasDerived = derivedClusters.size > 0;
+    // Station-dim logic uses a single cluster id. Pin wins when nothing else
+    // is hovered/focused, hover trumps pin while the cursor is on the map.
+    const stationFocusCluster = hoveredCluster != null
+      ? hoveredCluster
+      : (pinnedCluster != null ? pinnedCluster : null);
     const posLookup = {};
     let geoSumLng = 0, geoSumLat = 0, umapSumLng = 0, umapSumLat = 0, umapN = 0;
     for (const s of stations) {
@@ -633,7 +798,7 @@ function render({ model, el }) {
       .map(([k, v]) => `${k}:${v}`)
       .sort()
       .join('|');
-    const styleKey = `${focus}__${highlightKey}__${outKey}__${inKey}__${hasSel}__${spatialMix}__${hoveredCluster}`;
+    const styleKey = `${focus}__${highlightKey}__${outKey}__${inKey}__${hasSel}__${spatialMix}__${hoveredCluster}__${pinnedCluster}`;
 
     let peakLinkWeight = 0;
     for (const v of out.values()) peakLinkWeight = Math.max(peakLinkWeight, v);
@@ -648,31 +813,175 @@ function render({ model, el }) {
       const wo = out.has(n) ? Math.min(1, Math.max(0, out.get(n) || 0)) : 0;
       const wi = inn.has(n) ? Math.min(1, Math.max(0, inn.get(n) || 0)) : 0;
       const w = Math.max(wo, wi);
-      return 100 + 125 * Math.sqrt(w);
+      return 78 + 96 * Math.sqrt(w);
     };
 
     const focusHubRadius = () =>
-      178 + 48 * Math.sqrt(Math.min(1, peakLinkWeight));
+      138 + 38 * Math.sqrt(Math.min(1, peakLinkWeight));
 
     const palRgb = resolvePaletteRgb(store);
+
+    // ---- Alpha-shape neighborhood polygons (rendered below stations) ----
+    // We only morph vertices when spatial_mix > 0 to keep the common case fast.
+    const cp = store.cluster_polygons.get() || {};
+    const showNbhd = store.show_neighborhoods.get();
+    const alphaIdx = Math.max(0, Math.min(
+      (cp.levels_miles?.length || 1) - 1,
+      Number(store.alpha_index.get()) | 0,
+    ));
+    // polyData: one entry per (cluster, polygon-part). Vertices morph between
+    // geo and UMAP space when the spatial slider moves, but we also fade the
+    // whole layer toward 0 alpha as we approach UMAP — alpha shapes computed
+    // in geographic space don't carry semantic meaning once they're warped
+    // into the UMAP layout.
+    const polyData = [];
+    if (showNbhd && Array.isArray(cp.polygons) && cp.polygons.length) {
+      const t = spatialMix;
+      const useUmap = t > 0;
+      for (const cluster of cp.polygons) {
+        const byLevel = cluster.by_level || [];
+        const polys = byLevel[alphaIdx] || [];
+        for (let pi = 0; pi < polys.length; pi += 1) {
+          const p = polys[pi];
+          const geoRings = p.geo || [];
+          const umapRings = p.umap || [];
+          // deck.gl PolygonLayer accepts [outer, hole1, hole2, ...]; each ring [[lng,lat],...]
+          let rings;
+          if (!useUmap) {
+            rings = geoRings;
+          } else {
+            rings = geoRings.map((ring, ri) => {
+              const uring = umapRings[ri] || ring;
+              return ring.map(([lng, lat], vi) => {
+                const u = uring[vi] || [lng, lat];
+                const ulng = Number(u[0]) + dLng;
+                const ulat = Number(u[1]) + dLat;
+                return [Number(lng) * (1 - t) + ulng * t, Number(lat) * (1 - t) + ulat * t];
+              });
+            });
+          }
+          polyData.push({
+            cluster_id: cluster.cluster_id,
+            poly_id: pi,
+            polygon: rings,
+          });
+        }
+      }
+    }
+
+    // Stable cache key for `derivedClusters` so deck.gl can detect changes via
+    // updateTriggers (Set identity isn't enough — we need a value-based key).
+    const derivedKey = [...derivedClusters].sort((a, b) => a - b).join(',');
+    const isDerived = (cid) => derivedClusters.has(cid);
+    // Linear fade as we morph toward UMAP — geo alpha shapes lose meaning once
+    // they're warped, so by spatial_mix=1 the layer is fully invisible.
+    const nbhdFade = Math.max(0, 1 - spatialMix);
+    // Highlight pushes the *border* (width + alpha) rather than the fill, so
+    // selected NBHDs read as outlined regions and the stations inside stay
+    // legible. Idle fill is light, dim fill is barely there.
+    const NBHD_FILL_IDLE = 70;
+    const NBHD_FILL_HOVER = 90;
+    const NBHD_FILL_DIM = 18;
+    const NBHD_LINE_IDLE_ALPHA = 130;
+    const NBHD_LINE_HOVER_ALPHA = 245;
+    const NBHD_LINE_DIM_ALPHA = 50;
+    const NBHD_LINE_IDLE_W = 0.8;
+    const NBHD_LINE_HOVER_W = 3.2;
+    const NBHD_LINE_DIM_W = 0.4;
+    const polygons = new PolygonLayer({
+      id: 'bike-cluster-nbhd',
+      data: polyData,
+      visible: showNbhd && polyData.length > 0 && nbhdFade > 0.001,
+      pickable: nbhdFade > 0.5,
+      stroked: true,
+      filled: true,
+      lineWidthUnits: 'pixels',
+      getPolygon: (d) => d.polygon,
+      getFillColor: (d) => {
+        const [r, g, b] = clusterRgbFromId(d.cluster_id, palRgb);
+        const a = !hasDerived
+          ? NBHD_FILL_IDLE
+          : isDerived(d.cluster_id) ? NBHD_FILL_HOVER : NBHD_FILL_DIM;
+        return [r, g, b, Math.round(a * nbhdFade)];
+      },
+      getLineColor: (d) => {
+        const [r, g, b] = clusterRgbFromId(d.cluster_id, palRgb);
+        const a = !hasDerived
+          ? NBHD_LINE_IDLE_ALPHA
+          : isDerived(d.cluster_id) ? NBHD_LINE_HOVER_ALPHA : NBHD_LINE_DIM_ALPHA;
+        return [r, g, b, Math.round(a * nbhdFade)];
+      },
+      getLineWidth: (d) => {
+        const w = !hasDerived
+          ? NBHD_LINE_IDLE_W
+          : isDerived(d.cluster_id) ? NBHD_LINE_HOVER_W : NBHD_LINE_DIM_W;
+        return w * nbhdFade;
+      },
+      transitions: {
+        getFillColor: 250,
+        getLineColor: 250,
+        getLineWidth: 250,
+      },
+      updateTriggers: {
+        getFillColor: [derivedKey, palRgb, spatialMix, renderVersion],
+        getLineColor: [derivedKey, palRgb, spatialMix, renderVersion],
+        getLineWidth: [derivedKey, spatialMix, renderVersion],
+        getPolygon: [spatialMix, alphaIdx, renderVersion],
+      },
+      onHover: (info) => {
+        const cid = info.object ? info.object.cluster_id : null;
+        if (store.hovered_cluster.get() !== cid) {
+          store.hovered_cluster.set(cid);
+          scheduleRender();
+        }
+      },
+      onClick: (info) => {
+        if (!info.object) return;
+        // NBHD click pins the cluster for a persistent, discussion-ready
+        // highlight. Clicking the same cluster again unpins. We also clear any
+        // prior clustergram-driven selection (focus/highlights/edges +
+        // click_info / matrix_axis_slice upstream) so the pinned NBHD view
+        // starts clean.
+        const cid = Number(info.object.cluster_id);
+        const current = store.pinned_cluster.get();
+        const next = current === cid ? null : cid;
+        store.pinned_cluster.set(next);
+        const hadSel = Boolean(store.focus.get())
+          || (store.highlights.get() || []).length > 0
+          || (store.edges.get() || []).length > 0;
+        if (hadSel) {
+          setDerivedState(store, { focus: '', highlights: [], edges: [] });
+          lastActionKey = null;
+          model.set('click_info', {});
+          model.set('matrix_axis_slice', {});
+          model.save_changes();
+        }
+        scheduleRender();
+        log(store, 'nbhd click -> pin', next);
+      },
+    });
 
     // Force a new data container each render so style-only updates always propagate
     const pointData = stations.map((d) => d);
 
+    const showStations = store.show_stations.get();
     const points = new ScatterplotLayer({
       id: 'bike-stations',
       data: pointData,
-      pickable: true,
+      visible: showStations,
+      pickable: showStations,
       radiusUnits: 'meters',
-      radiusMinPixels: 3,
-      radiusMaxPixels: 56,
+      // Low-ish min-pixel floor so dots still shrink at low zooms;
+      // selected/focus stations stay readable via their larger meter radii.
+      radiusMinPixels: 1.5,
+      radiusMaxPixels: 48,
       getPosition: (d) => posLookup[d.name] || [Number(d.lng), Number(d.lat)],
       getRadius: (d) => {
         const n = d.name;
         if (focus && n === focus) return focusHubRadius();
         if (focus && (out.has(n) || inn.has(n))) return linkedRadius(n);
-        if (highlights.has(n)) return 90;
-        return hasSel ? 70 : 90;
+        if (highlights.has(n)) return 66;
+        return hasSel ? 50 : 66;
       },
       getFillColor: (d) => {
         const n = d.name;
@@ -695,8 +1004,8 @@ function render({ model, el }) {
           if (highlights.has(n)) return [c[0], c[1], c[2], 242];
           return [c[0], c[1], c[2], 36];
         }
-        if (hoveredCluster != null) {
-          if (d.cluster_id === hoveredCluster) return clusterFillWithAlpha(d.cluster_id, 248, palRgb);
+        if (stationFocusCluster != null) {
+          if (d.cluster_id === stationFocusCluster) return clusterFillWithAlpha(d.cluster_id, 248, palRgb);
           return clusterFillWithAlpha(d.cluster_id, 50, palRgb);
         }
         return clusterFillColor(d.cluster_id, palRgb);
@@ -720,6 +1029,9 @@ function render({ model, el }) {
       onClick: (info) => {
         if (!info.object) return;
         const n = String(info.object.name || '').trim();
+        // Station click always exits NBHD-pin mode — it's a distinct focus
+        // gesture. Hover state clears naturally via the render pipeline.
+        if (store.pinned_cluster.get() != null) store.pinned_cluster.set(null);
         if (store.focus.get() === n) {
           setDerivedState(store, { focus: '', highlights: [], edges: [] });
           lastActionKey = null;
@@ -780,12 +1092,18 @@ function render({ model, el }) {
         const a = Math.round(Math.max(0, Math.min(1, Number(d.opacity) || 0)) * 255);
         if (d.direction === 'in') return [70, 150, 255, a];
         if (d.direction === 'out') return [255, 70, 70, a];
-        return [255, 240, 120, a];
+        // 'direct' = matrix-cell click linking two stations. Use a near-black
+        // line so it reads against both the map and the highlighted NBHDs;
+        // bump its minimum opacity so even small probabilities stay visible.
+        return [24, 28, 36, Math.max(220, a)];
       },
     });
 
     const basemapAlpha = Math.round(255 * (1 - spatialMix));
-    return [basemapLayer(basemapAlpha), lines, points];
+    // Order matters: basemap, then neighborhood polygons, then flow lines,
+    // then station points on top. Station picking shadows polygon picking —
+    // stations stay clickable when NBHDs are visible.
+    return [basemapLayer(basemapAlpha), polygons, lines, points];
   };
 
   let pendingProps = null;
@@ -796,12 +1114,16 @@ function render({ model, el }) {
     const h = Number(store.height.get() || 800);
     root.style.width = `${w}px`;
     root.style.height = `${h}px`;
-
+    // Canvas takes whatever's left after the toolbar; clamp to a sane minimum
+    // so very-short widgets still render *something*.
+    const canvasH = Math.max(120, h - TOPBAR_HEIGHT);
+    mapHolder.style.width = `${w}px`;
+    mapHolder.style.height = `${canvasH}px`;
 
     const props = {
-      parent: root,
+      parent: mapHolder,
       width: w,
-      height: h,
+      height: canvasH,
       controller: { doubleClickZoom: false },
       layers: buildLayers(),
       getTooltip: ({ object, layer }) => {
@@ -902,6 +1224,11 @@ function render({ model, el }) {
     store.palette_rgb,
     store.matrix_axis_slice,
     store.spatial_mix,
+    store.cluster_polygons,
+    store.alpha_index,
+    store.show_neighborhoods,
+    store.show_stations,
+    store.pinned_cluster,
   ].forEach((obs) => obs.subscribe(() => scheduleRender(), { immediate: false }));
 
   const syncFromModel = () => {
@@ -926,6 +1253,12 @@ function render({ model, el }) {
     const mixVal = model.get('spatial_mix') || 0;
     store.spatial_mix.set(mixVal);
     slider.value = String(mixVal);
+    const cp = model.get('cluster_polygons') || {};
+    store.cluster_polygons.set(cp && typeof cp === 'object' ? cp : {});
+    const ai = Number(model.get('alpha_index'));
+    store.alpha_index.set(Number.isFinite(ai) ? (ai | 0) : 4);
+    store.show_neighborhoods.set(Boolean(model.get('show_neighborhoods') ?? true));
+    store.show_stations.set(Boolean(model.get('show_stations') ?? true));
     log(store, 'syncFromModel done', {
       linkSeq: linkInteractionSeq,
       rows: (store.selected_rows.get() || []).length,
@@ -951,6 +1284,10 @@ function render({ model, el }) {
     'palette_rgb',
     'matrix_axis_slice',
     'spatial_mix',
+    'cluster_polygons',
+    'alpha_index',
+    'show_neighborhoods',
+    'show_stations',
   ].forEach((name) => model.on(`change:${name}`, syncFromModel));
 
   model.on('change:cg_row_names', () => scheduleRender());

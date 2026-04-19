@@ -6721,12 +6721,12 @@ var Resource = class {
   /**
    * Create a new Resource. Called from Subclass
    */
-  constructor(device, props, defaultProps14) {
+  constructor(device, props, defaultProps15) {
     if (!device) {
       throw new Error("no device");
     }
     this._device = device;
-    this.props = selectivelyMerge(props, defaultProps14);
+    this.props = selectivelyMerge(props, defaultProps15);
     const id = this.props.id !== "undefined" ? this.props.id : uid(this[Symbol.toStringTag]);
     this.props.id = id;
     this.id = id;
@@ -6819,8 +6819,8 @@ var Resource = class {
     stats.get(`${name2}s Active`).incrementCount();
   }
 };
-function selectivelyMerge(props, defaultProps14) {
-  const mergedProps = { ...defaultProps14 };
+function selectivelyMerge(props, defaultProps15) {
+  const mergedProps = { ...defaultProps15 };
   for (const key in props) {
     if (props[key] !== void 0) {
       mergedProps[key] = props[key];
@@ -7608,8 +7608,8 @@ var Texture = class _Texture extends Resource {
   /** "Time" of last update. Monotonically increasing timestamp */
   updateTimestamp;
   /** Do not use directly. Create with device.createTexture() */
-  constructor(device, props, defaultProps14 = _Texture.defaultProps) {
-    super(device, props, defaultProps14);
+  constructor(device, props, defaultProps15 = _Texture.defaultProps) {
+    super(device, props, defaultProps15);
     this.dimension = this.props.dimension;
     this.format = this.props.format;
     this.width = this.props.width;
@@ -36483,7 +36483,7 @@ var TYPE_DEFINITIONS = {
 };
 function parsePropTypes(propDefs) {
   const propTypes = {};
-  const defaultProps14 = {};
+  const defaultProps15 = {};
   const deprecatedProps = {};
   for (const [propName, propDef] of Object.entries(propDefs)) {
     const deprecated = propDef?.deprecatedFor;
@@ -36492,10 +36492,10 @@ function parsePropTypes(propDefs) {
     } else {
       const propType = parsePropType(propName, propDef);
       propTypes[propName] = propType;
-      defaultProps14[propName] = propType.value;
+      defaultProps15[propName] = propType.value;
     }
   }
-  return { propTypes, defaultProps: defaultProps14, deprecatedProps };
+  return { propTypes, defaultProps: defaultProps15, deprecatedProps };
 }
 function parsePropType(name2, propDef) {
   switch (getTypeOf2(propDef)) {
@@ -36571,11 +36571,11 @@ function getPropsPrototype(componentClass, extensions) {
       }
     }
   }
-  const defaultProps14 = getOwnProperty(componentClass, cacheKey);
-  if (!defaultProps14) {
+  const defaultProps15 = getOwnProperty(componentClass, cacheKey);
+  if (!defaultProps15) {
     return componentClass[cacheKey] = createPropsPrototypeAndTypes(componentClass, extensions || []);
   }
-  return defaultProps14;
+  return defaultProps15;
 }
 function createPropsPrototypeAndTypes(componentClass, extensions) {
   const parent = componentClass.prototype;
@@ -36586,30 +36586,30 @@ function createPropsPrototypeAndTypes(componentClass, extensions) {
   const parentDefaultProps = getPropsPrototype(parentClass);
   const componentDefaultProps = getOwnProperty(componentClass, "defaultProps") || {};
   const componentPropDefs = parsePropTypes(componentDefaultProps);
-  const defaultProps14 = Object.assign(/* @__PURE__ */ Object.create(null), parentDefaultProps, componentPropDefs.defaultProps);
+  const defaultProps15 = Object.assign(/* @__PURE__ */ Object.create(null), parentDefaultProps, componentPropDefs.defaultProps);
   const propTypes = Object.assign(/* @__PURE__ */ Object.create(null), parentDefaultProps?.[PROP_TYPES_SYMBOL], componentPropDefs.propTypes);
   const deprecatedProps = Object.assign(/* @__PURE__ */ Object.create(null), parentDefaultProps?.[DEPRECATED_PROPS_SYMBOL], componentPropDefs.deprecatedProps);
   for (const extension of extensions) {
     const extensionDefaultProps = getPropsPrototype(extension.constructor);
     if (extensionDefaultProps) {
-      Object.assign(defaultProps14, extensionDefaultProps);
+      Object.assign(defaultProps15, extensionDefaultProps);
       Object.assign(propTypes, extensionDefaultProps[PROP_TYPES_SYMBOL]);
       Object.assign(deprecatedProps, extensionDefaultProps[DEPRECATED_PROPS_SYMBOL]);
     }
   }
-  createPropsPrototype(defaultProps14, componentClass);
-  addAsyncPropsToPropPrototype(defaultProps14, propTypes);
-  addDeprecatedPropsToPropPrototype(defaultProps14, deprecatedProps);
-  defaultProps14[PROP_TYPES_SYMBOL] = propTypes;
-  defaultProps14[DEPRECATED_PROPS_SYMBOL] = deprecatedProps;
+  createPropsPrototype(defaultProps15, componentClass);
+  addAsyncPropsToPropPrototype(defaultProps15, propTypes);
+  addDeprecatedPropsToPropPrototype(defaultProps15, deprecatedProps);
+  defaultProps15[PROP_TYPES_SYMBOL] = propTypes;
+  defaultProps15[DEPRECATED_PROPS_SYMBOL] = deprecatedProps;
   if (extensions.length === 0 && !hasOwnProperty(componentClass, "_propTypes")) {
     componentClass._propTypes = propTypes;
   }
-  return defaultProps14;
+  return defaultProps15;
 }
-function createPropsPrototype(defaultProps14, componentClass) {
+function createPropsPrototype(defaultProps15, componentClass) {
   const id = getComponentName(componentClass);
-  Object.defineProperties(defaultProps14, {
+  Object.defineProperties(defaultProps15, {
     // `id` is treated specially because layer might need to override it
     id: {
       writable: true,
@@ -36617,9 +36617,9 @@ function createPropsPrototype(defaultProps14, componentClass) {
     }
   });
 }
-function addDeprecatedPropsToPropPrototype(defaultProps14, deprecatedProps) {
+function addDeprecatedPropsToPropPrototype(defaultProps15, deprecatedProps) {
   for (const propName in deprecatedProps) {
-    Object.defineProperty(defaultProps14, propName, {
+    Object.defineProperty(defaultProps15, propName, {
       enumerable: false,
       set(newValue) {
         const nameStr = `${this.id}: ${propName}`;
@@ -36633,7 +36633,7 @@ function addDeprecatedPropsToPropPrototype(defaultProps14, deprecatedProps) {
     });
   }
 }
-function addAsyncPropsToPropPrototype(defaultProps14, propTypes) {
+function addAsyncPropsToPropPrototype(defaultProps15, propTypes) {
   const defaultValues = {};
   const descriptors = {};
   for (const propName in propTypes) {
@@ -36644,9 +36644,9 @@ function addAsyncPropsToPropPrototype(defaultProps14, propTypes) {
       descriptors[name2] = getDescriptorForAsyncProp(name2);
     }
   }
-  defaultProps14[ASYNC_DEFAULTS_SYMBOL] = defaultValues;
-  defaultProps14[ASYNC_ORIGINAL_SYMBOL] = {};
-  Object.defineProperties(defaultProps14, descriptors);
+  defaultProps15[ASYNC_DEFAULTS_SYMBOL] = defaultValues;
+  defaultProps15[ASYNC_ORIGINAL_SYMBOL] = {};
+  Object.defineProperties(defaultProps15, descriptors);
 }
 function getDescriptorForAsyncProp(name2) {
   return {
@@ -41449,6 +41449,169 @@ function replaceInRange({ data, getIndex, dataRange, replace }) {
   };
 }
 
+// node_modules/@deck.gl/layers/dist/polygon-layer/polygon-layer.js
+var defaultLineColor = [0, 0, 0, 255];
+var defaultFillColor = [0, 0, 0, 255];
+var defaultProps9 = {
+  stroked: true,
+  filled: true,
+  extruded: false,
+  elevationScale: 1,
+  wireframe: false,
+  _normalize: true,
+  _windingOrder: "CW",
+  lineWidthUnits: "meters",
+  lineWidthScale: 1,
+  lineWidthMinPixels: 0,
+  lineWidthMaxPixels: Number.MAX_SAFE_INTEGER,
+  lineJointRounded: false,
+  lineMiterLimit: 4,
+  getPolygon: { type: "accessor", value: (f2) => f2.polygon },
+  // Polygon fill color
+  getFillColor: { type: "accessor", value: defaultFillColor },
+  // Point, line and polygon outline color
+  getLineColor: { type: "accessor", value: defaultLineColor },
+  // Line and polygon outline accessors
+  getLineWidth: { type: "accessor", value: 1 },
+  // Polygon extrusion accessor
+  getElevation: { type: "accessor", value: 1e3 },
+  // Optional material for 'lighting' shader module
+  material: true
+};
+var PolygonLayer = class extends composite_layer_default {
+  initializeState() {
+    this.state = {
+      paths: [],
+      pathsDiff: null
+    };
+    if (this.props.getLineDashArray) {
+      log_default.removed("getLineDashArray", "PathStyleExtension")();
+    }
+  }
+  updateState({ changeFlags }) {
+    const geometryChanged = changeFlags.dataChanged || changeFlags.updateTriggersChanged && (changeFlags.updateTriggersChanged.all || changeFlags.updateTriggersChanged.getPolygon);
+    if (geometryChanged && Array.isArray(changeFlags.dataChanged)) {
+      const paths = this.state.paths.slice();
+      const pathsDiff = changeFlags.dataChanged.map((dataRange) => replaceInRange({
+        data: paths,
+        getIndex: (p2) => p2.__source.index,
+        dataRange,
+        replace: this._getPaths(dataRange)
+      }));
+      this.setState({ paths, pathsDiff });
+    } else if (geometryChanged) {
+      this.setState({
+        paths: this._getPaths(),
+        pathsDiff: null
+      });
+    }
+  }
+  _getPaths(dataRange = {}) {
+    const { data, getPolygon, positionFormat, _normalize } = this.props;
+    const paths = [];
+    const positionSize = positionFormat === "XY" ? 2 : 3;
+    const { startRow, endRow } = dataRange;
+    const { iterable, objectInfo } = createIterable(data, startRow, endRow);
+    for (const object of iterable) {
+      objectInfo.index++;
+      let polygon = getPolygon(object, objectInfo);
+      if (_normalize) {
+        polygon = normalize5(polygon, positionSize);
+      }
+      const { holeIndices } = polygon;
+      const positions = polygon.positions || polygon;
+      if (holeIndices) {
+        for (let i2 = 0; i2 <= holeIndices.length; i2++) {
+          const path = positions.slice(holeIndices[i2 - 1] || 0, holeIndices[i2] || positions.length);
+          paths.push(this.getSubLayerRow({ path }, object, objectInfo.index));
+        }
+      } else {
+        paths.push(this.getSubLayerRow({ path: positions }, object, objectInfo.index));
+      }
+    }
+    return paths;
+  }
+  /* eslint-disable complexity */
+  renderLayers() {
+    const { data, _dataDiff, stroked, filled, extruded, wireframe, _normalize, _windingOrder, elevationScale, transitions, positionFormat } = this.props;
+    const { lineWidthUnits, lineWidthScale, lineWidthMinPixels, lineWidthMaxPixels, lineJointRounded, lineMiterLimit, lineDashJustified } = this.props;
+    const { getFillColor, getLineColor, getLineWidth, getLineDashArray, getElevation, getPolygon, updateTriggers, material } = this.props;
+    const { paths, pathsDiff } = this.state;
+    const FillLayer = this.getSubLayerClass("fill", solid_polygon_layer_default);
+    const StrokeLayer = this.getSubLayerClass("stroke", path_layer_default);
+    const polygonLayer = this.shouldRenderSubLayer("fill", paths) && new FillLayer({
+      _dataDiff,
+      extruded,
+      elevationScale,
+      filled,
+      wireframe,
+      _normalize,
+      _windingOrder,
+      getElevation,
+      getFillColor,
+      getLineColor: extruded && wireframe ? getLineColor : defaultLineColor,
+      material,
+      transitions
+    }, this.getSubLayerProps({
+      id: "fill",
+      updateTriggers: updateTriggers && {
+        getPolygon: updateTriggers.getPolygon,
+        getElevation: updateTriggers.getElevation,
+        getFillColor: updateTriggers.getFillColor,
+        // using a legacy API to invalid lineColor attributes
+        // if (extruded && wireframe) has changed
+        lineColors: extruded && wireframe,
+        getLineColor: updateTriggers.getLineColor
+      }
+    }), {
+      data,
+      positionFormat,
+      getPolygon
+    });
+    const polygonLineLayer = !extruded && stroked && this.shouldRenderSubLayer("stroke", paths) && new StrokeLayer({
+      _dataDiff: pathsDiff && (() => pathsDiff),
+      widthUnits: lineWidthUnits,
+      widthScale: lineWidthScale,
+      widthMinPixels: lineWidthMinPixels,
+      widthMaxPixels: lineWidthMaxPixels,
+      jointRounded: lineJointRounded,
+      miterLimit: lineMiterLimit,
+      dashJustified: lineDashJustified,
+      // Already normalized
+      _pathType: "loop",
+      transitions: transitions && {
+        getWidth: transitions.getLineWidth,
+        getColor: transitions.getLineColor,
+        getPath: transitions.getPolygon
+      },
+      getColor: this.getSubLayerAccessor(getLineColor),
+      getWidth: this.getSubLayerAccessor(getLineWidth),
+      getDashArray: this.getSubLayerAccessor(getLineDashArray)
+    }, this.getSubLayerProps({
+      id: "stroke",
+      updateTriggers: updateTriggers && {
+        getWidth: updateTriggers.getLineWidth,
+        getColor: updateTriggers.getLineColor,
+        getDashArray: updateTriggers.getLineDashArray
+      }
+    }), {
+      data: paths,
+      positionFormat,
+      getPath: (x2) => x2.path
+    });
+    return [
+      // If not extruded: flat fill layer is drawn below outlines
+      !extruded && polygonLayer,
+      polygonLineLayer,
+      // If extruded: draw fill layer last for correct blending behavior
+      extruded && polygonLayer
+    ];
+  }
+};
+PolygonLayer.layerName = "PolygonLayer";
+PolygonLayer.defaultProps = defaultProps9;
+var polygon_layer_default = PolygonLayer;
+
 // node_modules/@deck.gl/layers/dist/geojson-layer/geojson-binary.js
 function binaryToFeatureForAccesor(data, index2) {
   if (!data) {
@@ -41534,7 +41697,7 @@ DECKGL_FILTER_COLOR(fragColor, geometry);
 // node_modules/@deck.gl/layers/dist/text-layer/multi-icon-layer/multi-icon-layer.js
 var DEFAULT_BUFFER2 = 192 / 256;
 var EMPTY_ARRAY3 = [];
-var defaultProps9 = {
+var defaultProps10 = {
   getIconOffsets: { type: "accessor", value: (x2) => x2.offsets },
   alphaCutoff: 1e-3,
   smoothing: 0.1,
@@ -41610,7 +41773,7 @@ var MultiIconLayer = class extends icon_layer_default {
     return icons ? Array.from(icons).flatMap((icon) => super.getInstanceIconFrame(icon)) : EMPTY_ARRAY3;
   }
 };
-MultiIconLayer.defaultProps = defaultProps9;
+MultiIconLayer.defaultProps = defaultProps10;
 MultiIconLayer.layerName = "MultiIconLayer";
 var multi_icon_layer_default = MultiIconLayer;
 
@@ -42232,7 +42395,7 @@ DECKGL_FILTER_COLOR(fragColor, geometry);
 `;
 
 // node_modules/@deck.gl/layers/dist/text-layer/text-background-layer/text-background-layer.js
-var defaultProps10 = {
+var defaultProps11 = {
   billboard: true,
   sizeScale: 1,
   sizeUnits: "pixels",
@@ -42348,7 +42511,7 @@ var TextBackgroundLayer = class extends layer_default {
     });
   }
 };
-TextBackgroundLayer.defaultProps = defaultProps10;
+TextBackgroundLayer.defaultProps = defaultProps11;
 TextBackgroundLayer.layerName = "TextBackgroundLayer";
 var text_background_layer_default = TextBackgroundLayer;
 
@@ -42365,7 +42528,7 @@ var ALIGNMENT_BASELINE = {
 };
 var DEFAULT_COLOR6 = [0, 0, 0, 255];
 var DEFAULT_LINE_HEIGHT = 1;
-var defaultProps11 = {
+var defaultProps12 = {
   billboard: true,
   sizeScale: 1,
   sizeUnits: "pixels",
@@ -42651,7 +42814,7 @@ var TextLayer = class extends composite_layer_default {
     setFontAtlasCacheLimit(limit);
   }
 };
-TextLayer.defaultProps = defaultProps11;
+TextLayer.defaultProps = defaultProps12;
 TextLayer.layerName = "TextLayer";
 var text_layer_default = TextLayer;
 
@@ -43007,7 +43170,7 @@ function createLayerPropsFromBinary(geojsonBinary, encodePickingColor) {
 
 // node_modules/@deck.gl/layers/dist/geojson-layer/geojson-layer.js
 var FEATURE_TYPES = ["points", "linestrings", "polygons"];
-var defaultProps12 = {
+var defaultProps13 = {
   ...getDefaultProps(POINT_LAYER.circle),
   ...getDefaultProps(POINT_LAYER.icon),
   ...getDefaultProps(POINT_LAYER.text),
@@ -43204,7 +43367,7 @@ var GeoJsonLayer = class extends composite_layer_default {
   }
 };
 GeoJsonLayer.layerName = "GeoJsonLayer";
-GeoJsonLayer.defaultProps = defaultProps12;
+GeoJsonLayer.defaultProps = defaultProps13;
 var geojson_layer_default = GeoJsonLayer;
 
 // node_modules/@deck.gl/geo-layers/dist/tileset-2d/tile-2d-header.js
@@ -44870,7 +45033,7 @@ function getPlaceholderInChildren(tile) {
 }
 
 // node_modules/@deck.gl/geo-layers/dist/tile-layer/tile-layer.js
-var defaultProps13 = {
+var defaultProps14 = {
   TilesetClass: Tileset2D,
   data: { type: "data", value: [] },
   dataComparator: urlType.equal,
@@ -45048,7 +45211,7 @@ var TileLayer = class extends composite_layer_default {
     return this.state.tileset.isTileVisible(tile, cullRect);
   }
 };
-TileLayer.defaultProps = defaultProps13;
+TileLayer.defaultProps = defaultProps14;
 TileLayer.layerName = "TileLayer";
 var tile_layer_default = TileLayer;
 
@@ -45087,7 +45250,16 @@ var createStore = () => ({
   palette_rgb: Observable([]),
   matrix_axis_slice: Observable({}),
   spatial_mix: Observable(0),
-  hovered_cluster: Observable(null)
+  hovered_cluster: Observable(null),
+  // Pre-computed alpha-shape neighborhoods keyed by cluster_id, sliced by alpha_index.
+  // See nbhd.compute_cluster_alpha_shapes for the wire format.
+  cluster_polygons: Observable({ levels_miles: [], polygons: [] }),
+  alpha_index: Observable(4),
+  show_neighborhoods: Observable(true),
+  show_stations: Observable(true),
+  // Persistent "pinned" cluster — survives slider changes, cluster-resolution
+  // tweaks, mouse leaves. Toggled by clicking an NBHD polygon.
+  pinned_cluster: Observable(null)
 });
 var log3 = (store, ...args) => {
   if (store.debug.get()) console.log("[bike-map]", ...args);
@@ -45300,40 +45472,133 @@ function fitViewState(stations) {
 function render({ model, el }) {
   const store = createStore();
   const root = document.createElement("div");
-  root.style.background = "#e2e4e8";
-  root.style.borderRadius = "4px";
-  root.style.overflow = "hidden";
-  root.style.position = "relative";
+  root.style.cssText = "background:#e2e4e8;border-radius:4px;overflow:hidden;display:flex;flex-direction:column;";
   el.appendChild(root);
-  const controlPanel = document.createElement("div");
-  controlPanel.style.cssText = "position:absolute;top:10px;right:10px;background:rgba(255,255,255,0.92);padding:8px 14px;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,0.15);z-index:1;font:12px system-ui,sans-serif;user-select:none;display:none;";
-  const sliderLabel = document.createElement("div");
-  sliderLabel.style.cssText = "margin-bottom:4px;color:#444;font-weight:500;";
-  sliderLabel.textContent = "Spatial \u2194 UMAP";
+  const TOPBAR_HEIGHT = 38;
+  const topbar = document.createElement("div");
+  topbar.style.cssText = "flex:0 0 auto;height:" + TOPBAR_HEIGHT + "px;box-sizing:border-box;display:flex;align-items:center;gap:14px;padding:0 12px;background:#f5f6f8;border-bottom:1px solid #d0d3d8;font:12px system-ui,sans-serif;color:#333;user-select:none;";
+  root.appendChild(topbar);
+  const mapHolder = document.createElement("div");
+  mapHolder.style.cssText = "flex:1 1 auto;position:relative;background:#e2e4e8;transition:background-color 200ms;";
+  root.appendChild(mapHolder);
+  const styleToggleButton = (btn, on) => {
+    btn.style.background = on ? "#1f77b4" : "#fff";
+    btn.style.color = on ? "#fff" : "#444";
+    btn.style.borderColor = on ? "#1f77b4" : "#ccc";
+  };
+  const makeToggle = (label, observable, modelKey) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = label;
+    btn.style.cssText = "padding:3px 10px;border:1px solid #ccc;border-radius:4px;background:#fff;color:#444;font:inherit;cursor:pointer;transition:all 0.18s;";
+    styleToggleButton(btn, observable.get());
+    btn.addEventListener("click", () => {
+      const next = !observable.get();
+      observable.set(next);
+      styleToggleButton(btn, next);
+      if (modelKey) {
+        model.set(modelKey, next);
+        model.save_changes();
+      }
+      scheduleRender();
+    });
+    observable.subscribe((v2) => styleToggleButton(btn, v2), { immediate: false });
+    return btn;
+  };
+  const toggleGroup = document.createElement("div");
+  toggleGroup.style.cssText = "display:flex;gap:6px;flex:0 0 auto;";
+  toggleGroup.appendChild(makeToggle("NBHD", store.show_neighborhoods, "show_neighborhoods"));
+  toggleGroup.appendChild(makeToggle("Stations", store.show_stations, "show_stations"));
+  topbar.appendChild(toggleGroup);
+  const divider = () => {
+    const d2 = document.createElement("div");
+    d2.style.cssText = "width:1px;align-self:stretch;background:#d0d3d8;margin:6px 0;";
+    return d2;
+  };
+  topbar.appendChild(divider());
+  const spatialBlock = document.createElement("div");
+  spatialBlock.style.cssText = "display:flex;align-items:center;gap:8px;flex:1 1 auto;min-width:0;";
+  const spatialLabel = document.createElement("span");
+  spatialLabel.style.cssText = "color:#444;font-weight:500;white-space:nowrap;";
+  spatialLabel.textContent = "Spatial \u2194 UMAP";
   const slider = document.createElement("input");
   slider.type = "range";
   slider.min = "0";
   slider.max = "1";
   slider.step = "0.01";
   slider.value = "0";
-  slider.style.cssText = "width:140px;cursor:pointer;";
+  slider.style.cssText = "flex:1 1 auto;min-width:60px;cursor:pointer;";
   slider.addEventListener("input", () => {
     const t2 = parseFloat(slider.value);
     store.spatial_mix.set(t2);
     model.set("spatial_mix", t2);
     model.save_changes();
   });
-  controlPanel.appendChild(sliderLabel);
-  controlPanel.appendChild(slider);
-  for (const evt of ["pointerdown", "pointermove", "pointerup", "wheel", "dblclick"]) {
-    controlPanel.addEventListener(evt, (e2) => e2.stopPropagation());
-  }
-  root.appendChild(controlPanel);
+  spatialBlock.appendChild(spatialLabel);
+  spatialBlock.appendChild(slider);
+  topbar.appendChild(spatialBlock);
+  let umapDividerEl = null;
   store.stations.subscribe((stations) => {
     const hasUmap = stations.some((s2) => s2.umap_lng != null && s2.umap_lat != null);
-    controlPanel.style.display = hasUmap ? "block" : "none";
+    spatialBlock.style.display = hasUmap ? "flex" : "none";
+    if (umapDividerEl) umapDividerEl.style.display = hasUmap ? "block" : "none";
   }, { immediate: true });
-  root.addEventListener("mouseleave", () => {
+  umapDividerEl = divider();
+  topbar.appendChild(umapDividerEl);
+  const nbhdBlock = document.createElement("div");
+  nbhdBlock.style.cssText = "display:flex;align-items:center;gap:8px;flex:1 1 auto;min-width:0;";
+  const nbhdLabel = document.createElement("span");
+  nbhdLabel.style.cssText = "color:#444;font-weight:500;white-space:nowrap;";
+  nbhdLabel.textContent = "NBHD radius";
+  const nbhdSlider = document.createElement("input");
+  nbhdSlider.type = "range";
+  nbhdSlider.min = "0";
+  nbhdSlider.max = "0";
+  nbhdSlider.step = "1";
+  nbhdSlider.value = "0";
+  nbhdSlider.style.cssText = "flex:1 1 auto;min-width:60px;cursor:pointer;";
+  const nbhdValue = document.createElement("span");
+  nbhdValue.style.cssText = "color:#666;font-variant-numeric:tabular-nums;min-width:54px;text-align:right;white-space:nowrap;";
+  const formatMiles = (mi) => mi < 0.1 ? `${(mi * 5280).toFixed(0)} ft` : `${mi.toFixed(2)} mi`;
+  const refreshNbhdSlider = () => {
+    const cp = store.cluster_polygons.get() || {};
+    const levels = Array.isArray(cp.levels_miles) ? cp.levels_miles : [];
+    if (!levels.length) {
+      nbhdBlock.style.display = "none";
+      return;
+    }
+    nbhdBlock.style.display = "flex";
+    nbhdSlider.max = String(levels.length - 1);
+    const idx = Math.max(0, Math.min(levels.length - 1, store.alpha_index.get() | 0));
+    nbhdSlider.value = String(idx);
+    nbhdValue.textContent = formatMiles(Number(levels[idx]) || 0);
+  };
+  nbhdSlider.addEventListener("input", () => {
+    const idx = parseInt(nbhdSlider.value, 10) | 0;
+    store.alpha_index.set(idx);
+    refreshNbhdSlider();
+    model.set("alpha_index", idx);
+    model.save_changes();
+    scheduleRender();
+  });
+  nbhdBlock.appendChild(nbhdLabel);
+  nbhdBlock.appendChild(nbhdSlider);
+  nbhdBlock.appendChild(nbhdValue);
+  topbar.appendChild(nbhdBlock);
+  store.cluster_polygons.subscribe(refreshNbhdSlider, { immediate: true });
+  store.alpha_index.subscribe(refreshNbhdSlider, { immediate: false });
+  store.show_neighborhoods.subscribe((on) => {
+    nbhdBlock.style.opacity = on ? "1" : "0.4";
+    nbhdSlider.disabled = !on;
+  }, { immediate: true });
+  store.spatial_mix.subscribe((mix) => {
+    const t2 = Math.max(0, Math.min(1, Number(mix) || 0));
+    const r2 = Math.round(226 + (255 - 226) * t2);
+    const g2 = Math.round(228 + (255 - 228) * t2);
+    const b2 = Math.round(232 + (255 - 232) * t2);
+    mapHolder.style.background = `rgb(${r2},${g2},${b2})`;
+  }, { immediate: true });
+  mapHolder.addEventListener("mouseleave", () => {
     clearTimeout(hoverTimer);
     if (store.hovered_cluster.get() != null) {
       store.hovered_cluster.set(null);
@@ -45624,6 +45889,24 @@ function render({ model, el }) {
     const hasSel = Boolean(focus) || highlights.size > 0;
     const spatialMix = store.spatial_mix.get();
     const hoveredCluster = store.hovered_cluster.get();
+    const pinnedCluster = store.pinned_cluster.get();
+    const derivedClusters = /* @__PURE__ */ new Set();
+    if (pinnedCluster != null && pinnedCluster !== 0) {
+      derivedClusters.add(pinnedCluster);
+    }
+    if (hoveredCluster != null && hoveredCluster !== 0) {
+      derivedClusters.add(hoveredCluster);
+    }
+    if (derivedClusters.size === 0 && highlights.size > 0) {
+      const stationCluster = /* @__PURE__ */ new Map();
+      for (const s2 of stations) stationCluster.set(s2.name, s2.cluster_id);
+      for (const n3 of highlights) {
+        const cid = stationCluster.get(n3);
+        if (cid != null && cid !== 0) derivedClusters.add(cid);
+      }
+    }
+    const hasDerived = derivedClusters.size > 0;
+    const stationFocusCluster = hoveredCluster != null ? hoveredCluster : pinnedCluster != null ? pinnedCluster : null;
     const posLookup = {};
     let geoSumLng = 0, geoSumLat = 0, umapSumLng = 0, umapSumLat = 0, umapN = 0;
     for (const s2 of stations) {
@@ -45653,7 +45936,7 @@ function render({ model, el }) {
     const highlightKey = Array.from(highlights).sort().join("|");
     const outKey = Array.from(out.entries()).map(([k2, v2]) => `${k2}:${v2}`).sort().join("|");
     const inKey = Array.from(inn.entries()).map(([k2, v2]) => `${k2}:${v2}`).sort().join("|");
-    const styleKey = `${focus}__${highlightKey}__${outKey}__${inKey}__${hasSel}__${spatialMix}__${hoveredCluster}`;
+    const styleKey = `${focus}__${highlightKey}__${outKey}__${inKey}__${hasSel}__${spatialMix}__${hoveredCluster}__${pinnedCluster}`;
     let peakLinkWeight = 0;
     for (const v2 of out.values()) peakLinkWeight = Math.max(peakLinkWeight, v2);
     for (const v2 of inn.values()) peakLinkWeight = Math.max(peakLinkWeight, v2);
@@ -45665,25 +45948,139 @@ function render({ model, el }) {
       const wo = out.has(n3) ? Math.min(1, Math.max(0, out.get(n3) || 0)) : 0;
       const wi = inn.has(n3) ? Math.min(1, Math.max(0, inn.get(n3) || 0)) : 0;
       const w2 = Math.max(wo, wi);
-      return 100 + 125 * Math.sqrt(w2);
+      return 78 + 96 * Math.sqrt(w2);
     };
-    const focusHubRadius = () => 178 + 48 * Math.sqrt(Math.min(1, peakLinkWeight));
+    const focusHubRadius = () => 138 + 38 * Math.sqrt(Math.min(1, peakLinkWeight));
     const palRgb = resolvePaletteRgb(store);
+    const cp = store.cluster_polygons.get() || {};
+    const showNbhd = store.show_neighborhoods.get();
+    const alphaIdx = Math.max(0, Math.min(
+      (cp.levels_miles?.length || 1) - 1,
+      Number(store.alpha_index.get()) | 0
+    ));
+    const polyData = [];
+    if (showNbhd && Array.isArray(cp.polygons) && cp.polygons.length) {
+      const t2 = spatialMix;
+      const useUmap = t2 > 0;
+      for (const cluster of cp.polygons) {
+        const byLevel = cluster.by_level || [];
+        const polys = byLevel[alphaIdx] || [];
+        for (let pi = 0; pi < polys.length; pi += 1) {
+          const p2 = polys[pi];
+          const geoRings = p2.geo || [];
+          const umapRings = p2.umap || [];
+          let rings;
+          if (!useUmap) {
+            rings = geoRings;
+          } else {
+            rings = geoRings.map((ring, ri) => {
+              const uring = umapRings[ri] || ring;
+              return ring.map(([lng, lat], vi) => {
+                const u2 = uring[vi] || [lng, lat];
+                const ulng = Number(u2[0]) + dLng;
+                const ulat = Number(u2[1]) + dLat;
+                return [Number(lng) * (1 - t2) + ulng * t2, Number(lat) * (1 - t2) + ulat * t2];
+              });
+            });
+          }
+          polyData.push({
+            cluster_id: cluster.cluster_id,
+            poly_id: pi,
+            polygon: rings
+          });
+        }
+      }
+    }
+    const derivedKey = [...derivedClusters].sort((a2, b2) => a2 - b2).join(",");
+    const isDerived = (cid) => derivedClusters.has(cid);
+    const nbhdFade = Math.max(0, 1 - spatialMix);
+    const NBHD_FILL_IDLE = 70;
+    const NBHD_FILL_HOVER = 90;
+    const NBHD_FILL_DIM = 18;
+    const NBHD_LINE_IDLE_ALPHA = 130;
+    const NBHD_LINE_HOVER_ALPHA = 245;
+    const NBHD_LINE_DIM_ALPHA = 50;
+    const NBHD_LINE_IDLE_W = 0.8;
+    const NBHD_LINE_HOVER_W = 3.2;
+    const NBHD_LINE_DIM_W = 0.4;
+    const polygons = new polygon_layer_default({
+      id: "bike-cluster-nbhd",
+      data: polyData,
+      visible: showNbhd && polyData.length > 0 && nbhdFade > 1e-3,
+      pickable: nbhdFade > 0.5,
+      stroked: true,
+      filled: true,
+      lineWidthUnits: "pixels",
+      getPolygon: (d2) => d2.polygon,
+      getFillColor: (d2) => {
+        const [r2, g2, b2] = clusterRgbFromId(d2.cluster_id, palRgb);
+        const a2 = !hasDerived ? NBHD_FILL_IDLE : isDerived(d2.cluster_id) ? NBHD_FILL_HOVER : NBHD_FILL_DIM;
+        return [r2, g2, b2, Math.round(a2 * nbhdFade)];
+      },
+      getLineColor: (d2) => {
+        const [r2, g2, b2] = clusterRgbFromId(d2.cluster_id, palRgb);
+        const a2 = !hasDerived ? NBHD_LINE_IDLE_ALPHA : isDerived(d2.cluster_id) ? NBHD_LINE_HOVER_ALPHA : NBHD_LINE_DIM_ALPHA;
+        return [r2, g2, b2, Math.round(a2 * nbhdFade)];
+      },
+      getLineWidth: (d2) => {
+        const w2 = !hasDerived ? NBHD_LINE_IDLE_W : isDerived(d2.cluster_id) ? NBHD_LINE_HOVER_W : NBHD_LINE_DIM_W;
+        return w2 * nbhdFade;
+      },
+      transitions: {
+        getFillColor: 250,
+        getLineColor: 250,
+        getLineWidth: 250
+      },
+      updateTriggers: {
+        getFillColor: [derivedKey, palRgb, spatialMix, renderVersion],
+        getLineColor: [derivedKey, palRgb, spatialMix, renderVersion],
+        getLineWidth: [derivedKey, spatialMix, renderVersion],
+        getPolygon: [spatialMix, alphaIdx, renderVersion]
+      },
+      onHover: (info) => {
+        const cid = info.object ? info.object.cluster_id : null;
+        if (store.hovered_cluster.get() !== cid) {
+          store.hovered_cluster.set(cid);
+          scheduleRender();
+        }
+      },
+      onClick: (info) => {
+        if (!info.object) return;
+        const cid = Number(info.object.cluster_id);
+        const current = store.pinned_cluster.get();
+        const next = current === cid ? null : cid;
+        store.pinned_cluster.set(next);
+        const hadSel = Boolean(store.focus.get()) || (store.highlights.get() || []).length > 0 || (store.edges.get() || []).length > 0;
+        if (hadSel) {
+          setDerivedState(store, { focus: "", highlights: [], edges: [] });
+          lastActionKey = null;
+          model.set("click_info", {});
+          model.set("matrix_axis_slice", {});
+          model.save_changes();
+        }
+        scheduleRender();
+        log3(store, "nbhd click -> pin", next);
+      }
+    });
     const pointData = stations.map((d2) => d2);
+    const showStations = store.show_stations.get();
     const points = new scatterplot_layer_default({
       id: "bike-stations",
       data: pointData,
-      pickable: true,
+      visible: showStations,
+      pickable: showStations,
       radiusUnits: "meters",
-      radiusMinPixels: 3,
-      radiusMaxPixels: 56,
+      // Low-ish min-pixel floor so dots still shrink at low zooms;
+      // selected/focus stations stay readable via their larger meter radii.
+      radiusMinPixels: 1.5,
+      radiusMaxPixels: 48,
       getPosition: (d2) => posLookup[d2.name] || [Number(d2.lng), Number(d2.lat)],
       getRadius: (d2) => {
         const n3 = d2.name;
         if (focus && n3 === focus) return focusHubRadius();
         if (focus && (out.has(n3) || inn.has(n3))) return linkedRadius(n3);
-        if (highlights.has(n3)) return 90;
-        return hasSel ? 70 : 90;
+        if (highlights.has(n3)) return 66;
+        return hasSel ? 50 : 66;
       },
       getFillColor: (d2) => {
         const n3 = d2.name;
@@ -45705,8 +46102,8 @@ function render({ model, el }) {
           if (highlights.has(n3)) return [c2[0], c2[1], c2[2], 242];
           return [c2[0], c2[1], c2[2], 36];
         }
-        if (hoveredCluster != null) {
-          if (d2.cluster_id === hoveredCluster) return clusterFillWithAlpha(d2.cluster_id, 248, palRgb);
+        if (stationFocusCluster != null) {
+          if (d2.cluster_id === stationFocusCluster) return clusterFillWithAlpha(d2.cluster_id, 248, palRgb);
           return clusterFillWithAlpha(d2.cluster_id, 50, palRgb);
         }
         return clusterFillColor(d2.cluster_id, palRgb);
@@ -45730,6 +46127,7 @@ function render({ model, el }) {
       onClick: (info) => {
         if (!info.object) return;
         const n3 = String(info.object.name || "").trim();
+        if (store.pinned_cluster.get() != null) store.pinned_cluster.set(null);
         if (store.focus.get() === n3) {
           setDerivedState(store, { focus: "", highlights: [], edges: [] });
           lastActionKey = null;
@@ -45787,11 +46185,11 @@ function render({ model, el }) {
         const a2 = Math.round(Math.max(0, Math.min(1, Number(d2.opacity) || 0)) * 255);
         if (d2.direction === "in") return [70, 150, 255, a2];
         if (d2.direction === "out") return [255, 70, 70, a2];
-        return [255, 240, 120, a2];
+        return [24, 28, 36, Math.max(220, a2)];
       }
     });
     const basemapAlpha = Math.round(255 * (1 - spatialMix));
-    return [basemapLayer(basemapAlpha), lines, points];
+    return [basemapLayer(basemapAlpha), polygons, lines, points];
   };
   let pendingProps = null;
   const prepareDeckProps = () => {
@@ -45800,10 +46198,13 @@ function render({ model, el }) {
     const h2 = Number(store.height.get() || 800);
     root.style.width = `${w2}px`;
     root.style.height = `${h2}px`;
+    const canvasH = Math.max(120, h2 - TOPBAR_HEIGHT);
+    mapHolder.style.width = `${w2}px`;
+    mapHolder.style.height = `${canvasH}px`;
     const props = {
-      parent: root,
+      parent: mapHolder,
       width: w2,
-      height: h2,
+      height: canvasH,
       controller: { doubleClickZoom: false },
       layers: buildLayers(),
       getTooltip: ({ object, layer }) => {
@@ -45885,7 +46286,12 @@ function render({ model, el }) {
     store.height,
     store.palette_rgb,
     store.matrix_axis_slice,
-    store.spatial_mix
+    store.spatial_mix,
+    store.cluster_polygons,
+    store.alpha_index,
+    store.show_neighborhoods,
+    store.show_stations,
+    store.pinned_cluster
   ].forEach((obs) => obs.subscribe(() => scheduleRender(), { immediate: false }));
   const syncFromModel = () => {
     const ci = JSON.stringify(model.get("click_info") || {});
@@ -45909,6 +46315,12 @@ function render({ model, el }) {
     const mixVal = model.get("spatial_mix") || 0;
     store.spatial_mix.set(mixVal);
     slider.value = String(mixVal);
+    const cp = model.get("cluster_polygons") || {};
+    store.cluster_polygons.set(cp && typeof cp === "object" ? cp : {});
+    const ai = Number(model.get("alpha_index"));
+    store.alpha_index.set(Number.isFinite(ai) ? ai | 0 : 4);
+    store.show_neighborhoods.set(Boolean(model.get("show_neighborhoods") ?? true));
+    store.show_stations.set(Boolean(model.get("show_stations") ?? true));
     log3(store, "syncFromModel done", {
       linkSeq: linkInteractionSeq,
       rows: (store.selected_rows.get() || []).length,
@@ -45931,7 +46343,11 @@ function render({ model, el }) {
     "debug",
     "palette_rgb",
     "matrix_axis_slice",
-    "spatial_mix"
+    "spatial_mix",
+    "cluster_polygons",
+    "alpha_index",
+    "show_neighborhoods",
+    "show_stations"
   ].forEach((name2) => model.on(`change:${name2}`, syncFromModel));
   model.on("change:cg_row_names", () => scheduleRender());
   model.on("change:cg_col_names", () => scheduleRender());

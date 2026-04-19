@@ -10,6 +10,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from bike_network_traffic.nbhd import (
+    DEFAULT_LEVELS_MILES,
+    compute_cluster_alpha_shapes,
+)
 from bike_network_traffic.util import (
     DEFAULT_STATION_PALETTE_HEX,
     build_coord_df,
@@ -155,6 +159,8 @@ def make_flow_widget(
     debug: bool = False,
     umap_neighbors: int = 8,
     umap_min_dist: float = 0.3,
+    nbhd_levels_miles: tuple[float, ...] | None = None,
+    nbhd_default_index: int = 4,
 ) -> BikeFlowMapWidget:
     """Build a :class:`BikeFlowMapWidget` populated from a stations + matrix pair.
 
@@ -214,6 +220,15 @@ def make_flow_widget(
         for r in coord_df.itertuples()
     ]
     flow.edge_index = {}
+
+    levels = nbhd_levels_miles or DEFAULT_LEVELS_MILES
+    flow.cluster_polygons = compute_cluster_alpha_shapes(
+        stations,
+        cluster_map,
+        levels_miles=levels,
+        umap_lookup=umap_lookup or None,
+    )
+    flow.alpha_index = max(0, min(int(nbhd_default_index), len(levels) - 1))
     return flow
 
 
