@@ -46004,7 +46004,7 @@ function render({ model, el }) {
     const NBHD_LINE_HOVER_W = 3.2;
     const NBHD_LINE_DIM_W = 0.4;
     const polygons = new polygon_layer_default({
-      id: "bike-cluster-nbhd",
+      id: `bike-cluster-nbhd-${alphaIdx}`,
       data: polyData,
       visible: showNbhd && polyData.length > 0 && nbhdFade > 1e-3,
       pickable: nbhdFade > 0.5,
@@ -46032,10 +46032,13 @@ function render({ model, el }) {
         getLineWidth: 250
       },
       updateTriggers: {
+        // alphaIdx is not here — the layer id already changes with it, so
+        // deck.gl will instantiate a fresh layer rather than retriggering
+        // attribute updates against stale geometry.
         getFillColor: [derivedKey, palRgb, spatialMix, renderVersion],
         getLineColor: [derivedKey, palRgb, spatialMix, renderVersion],
         getLineWidth: [derivedKey, spatialMix, renderVersion],
-        getPolygon: [spatialMix, alphaIdx, renderVersion]
+        getPolygon: [spatialMix, renderVersion]
       },
       onHover: (info) => {
         const cid = info.object ? info.object.cluster_id : null;

@@ -1,0 +1,590 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Engineering notes — bike_network_traffic</title>
+<meta name="description" content="How the linked deck.gl flow map and Celldega clustergram talk to each other, with notes on the data pipeline, alpha shapes, and the observable store that drives the JS widget.">
+
+<style>
+  :root {
+    --fg: #1c1f24;
+    --fg-muted: #5b6470;
+    --bg: #fafbfc;
+    --bg-card: #ffffff;
+    --border: #e3e6ea;
+    --accent: #0072B2;
+    --accent-hover: #005383;
+    --code-bg: #f1f3f5;
+    --shadow: 0 1px 2px rgba(15, 22, 36, 0.04), 0 4px 12px rgba(15, 22, 36, 0.04);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e8ecf1;
+      --fg-muted: #9aa3b1;
+      --bg: #14171c;
+      --bg-card: #1c2027;
+      --border: #2a2f38;
+      --accent: #56B4E9;
+      --accent-hover: #88c9ee;
+      --code-bg: #20242c;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 6px 18px rgba(0, 0, 0, 0.3);
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  main { max-width: 960px; margin: 0 auto; padding: 48px 32px 96px; }
+  .back { display: inline-block; color: var(--fg-muted); margin-bottom: 24px; font-size: 0.9rem; }
+  .back:hover { color: var(--accent); }
+  h1 {
+    font-size: 2.1rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    margin: 0 0 8px;
+  }
+  .tagline { color: var(--fg-muted); margin: 0 0 32px; font-size: 1.08rem; }
+  h2 {
+    font-size: 1.35rem;
+    font-weight: 650;
+    letter-spacing: -0.01em;
+    margin: 48px 0 14px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+  }
+  h3 {
+    font-size: 1.05rem;
+    font-weight: 650;
+    margin: 28px 0 8px;
+    color: var(--fg);
+  }
+  p { margin: 0 0 14px; }
+  ul, ol { margin: 0 0 14px; padding-left: 22px; }
+  li { margin: 4px 0; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { color: var(--accent-hover); text-decoration: underline; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas, monospace;
+    background: var(--code-bg);
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas, monospace;
+    font-size: 0.86rem;
+    line-height: 1.5;
+    margin: 12px 0 18px;
+  }
+  blockquote {
+    border-left: 3px solid var(--accent);
+    margin: 16px 0;
+    padding: 2px 16px;
+    color: var(--fg-muted);
+    background: var(--bg-card);
+    border-radius: 0 6px 6px 0;
+  }
+  .toc {
+    margin: 0 0 36px;
+    padding: 14px 20px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: var(--shadow);
+    font-size: 0.95rem;
+  }
+  .toc ul { margin: 6px 0; padding-left: 20px; }
+  .ascii {
+    background: var(--code-bg);
+    padding: 14px 18px;
+    border-radius: 8px;
+    overflow-x: auto;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas, monospace;
+    font-size: 0.82rem;
+    line-height: 1.45;
+    margin: 16px 0 24px;
+    white-space: pre;
+  }
+  footer {
+    margin-top: 64px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+    color: var(--fg-muted);
+    font-size: 0.88rem;
+  }
+</style>
+</head>
+
+<body>
+<main>
+
+<a class="back" href="index.html">&larr; Back to overview</a>
+
+<header>
+  <h1>Engineering notes</h1>
+  <p class="tagline">
+    How the linked flow map and clustergram talk to each other, and the plumbing
+    underneath: data pipeline, widget architecture, observable store, alpha-shape
+    neighborhoods, and the standalone HTML builds.
+  </p>
+</header>
+
+<nav class="toc">
+  <strong>Contents</strong>
+  <ul>
+    <li><a href="#arch">1. Architecture at a glance</a></li>
+    <li><a href="#data">2. Data pipeline</a></li>
+    <li><a href="#widgets">3. The two widgets</a></li>
+    <li><a href="#linkage">4. Clustergram &rarr; map linkage</a></li>
+    <li><a href="#store">5. Observable store on the JS side</a></li>
+    <li><a href="#layers">6. deck.gl layer stack &amp; picking</a></li>
+    <li><a href="#nbhd">7. Alpha-shape neighborhoods</a></li>
+    <li><a href="#umap">8. Spatial &harr; UMAP morph</a></li>
+    <li><a href="#static">9. Building the static HTMLs</a></li>
+    <li><a href="#future">10. Known limits &amp; future work</a></li>
+  </ul>
+</nav>
+
+<section id="arch">
+  <h2>1. Architecture at a glance</h2>
+  <p>
+    Two Jupyter widgets sit side-by-side in an <code>HBox</code>, both rendered via
+    <a href="https://anywidget.dev/">anywidget</a> (so they ship as ES modules that work in
+    JupyterLab, the standalone HTML exports, and anywhere <code>ipywidgets</code> renders):
+  </p>
+  <div class="ascii">┌──────────────────── HBox (flow &harr; clustergram) ────────────────────┐
+│                                                                       │
+│   ┌─── BikeFlowMapWidget ───┐       ┌─── celldega.viz.Clustergram ─┐  │
+│   │                         │       │                               │  │
+│   │  deck.gl layers:        │       │  Matrix component:            │  │
+│   │   ├─ basemap tiles      │       │   ├─ heatmap + dendrograms    │  │
+│   │   ├─ alpha-shape polys  │       │   ├─ manual category bars     │  │
+│   │   ├─ flow lines         │       │   └─ axis labels              │  │
+│   │   └─ station scatter    │       │                               │  │
+│   │                         │       │                               │  │
+│   │  Observable store       │       │  Internal JS store            │  │
+│   └──────────┬──────────────┘       └───────┬───────────────────────┘  │
+│              │                              │                          │
+│              │   jsdlink() in Python        │                          │
+│              │   (traitlets &harr; traitlets)   │                          │
+│              └──────── click_info, selected_rows/cols, &hellip; ────────────┘  │
+│                                                                       │
+└───────────────────────────────────────────────────────────────────────┘</div>
+  <p>
+    Everything visible to the user lives in the browser: two JS bundles, two anywidget
+    models, and a bidirectional traitlet bridge called <code>jsdlink</code> that mirrors
+    selected Python traitlets across both widgets so one can react to the other without
+    involving the kernel.
+  </p>
+</section>
+
+<section id="data">
+  <h2>2. Data pipeline</h2>
+  <p>
+    Each bike-share operator (Citi Bike NYC, Bluebikes Boston, Capital Bikeshare DC,
+    Divvy Chicago) publishes monthly trip CSVs to a public S3 bucket. The Python
+    package (<code>bike_network_traffic.data</code>) does the fetch + transform:
+  </p>
+  <ol>
+    <li>
+      Resolve a <em>(city, year, month)</em> tuple to one or more S3 URLs by parsing the
+      bucket&apos;s <code>index.html</code> (just a list of <code>&lt;Key&gt;</code> entries).
+      Month can be a single int, a list, or <code>None</code> for a whole year.
+    </li>
+    <li>
+      Download each monthly zip into <code>~/.cache/bike_network_traffic/</code>,
+      extract the trip CSV(s), and concatenate them. Streaming HTTP with a per-chunk
+      progress indicator is off by default so notebooks stay quiet.
+    </li>
+    <li>
+      Normalize schemas. Each operator went through a rename in 2021-ish
+      (<code>start_station_id</code> vs <code>from_station_id</code>, etc.); we map them
+      to a single canonical layout.
+    </li>
+    <li>
+      Build a <strong>station metadata frame</strong>
+      (<code>station_id</code>, <code>station_name</code>, <code>lat</code>,
+      <code>lng</code>) and the <strong>destination-probability matrix</strong>: for each
+      origin station <em>s</em>, the row is <em>P(destination = d | origin = s)</em>,
+      obtained by group-counting trip endpoints and normalizing.
+    </li>
+  </ol>
+  <p>
+    That probability matrix <em>is</em> our feature table for Celldega. Rows are origin
+    stations, columns are destination stations, values sum to 1 per row — the same shape
+    you&apos;d feed into a clustergram of expression data.
+  </p>
+
+  <h3>Clustering &amp; UMAP</h3>
+  <p>
+    <code>viz.make_station_clustergram</code> runs hierarchical clustering via
+    Celldega&apos;s <code>clust.Matrix</code> to produce both a rendered
+    <code>Clustergram</code> widget and a <code>{station_name: cluster_id}</code> map.
+    That map is the join key that lets the map render each station with its cluster
+    color and compute one alpha-shape per cluster.
+  </p>
+  <p>
+    Separately, the probability matrix goes through a small scanpy pipeline
+    (<code>anndata</code> &rarr; neighbors &rarr; UMAP) to get a 2-D embedding of each
+    origin station by its <em>behavioral</em> similarity to others. Stations that tend
+    to send riders to the same destinations end up near each other in UMAP space even
+    if they sit on opposite sides of the city. That embedding becomes the second
+    coordinate system on the map (see <a href="#umap">§8</a>).
+  </p>
+</section>
+
+<section id="widgets">
+  <h2>3. The two widgets</h2>
+
+  <h3>BikeFlowMapWidget (ours)</h3>
+  <p>
+    <code>src/bike_network_traffic/widget.py</code> is a tiny <code>anywidget.AnyWidget</code>
+    subclass. Its whole job is to declare a set of <code>traitlets</code> and point at
+    a bundled ES module:
+  </p>
+<pre>class BikeFlowMapWidget(anywidget.AnyWidget):
+    _esm = BUNDLE_PATH / "widget.js"
+
+    stations           = traitlets.List(default_value=[]).tag(sync=True)
+    edge_index         = traitlets.Dict(default_value={}).tag(sync=True)
+    click_info         = traitlets.Dict(default_value={}).tag(sync=True)
+    selected_rows      = traitlets.List(default_value=[]).tag(sync=True)
+    selected_cols      = traitlets.List(default_value=[]).tag(sync=True)
+    matrix_axis_slice  = traitlets.Dict(default_value={}).tag(sync=True)
+    palette_rgb        = traitlets.List(default_value=[]).tag(sync=True)
+    spatial_mix        = traitlets.Float(0.0).tag(sync=True)
+    cluster_polygons   = traitlets.Dict(default_value={}).tag(sync=True)
+    alpha_index        = traitlets.Int(4).tag(sync=True)
+    show_neighborhoods = traitlets.Bool(True).tag(sync=True)
+    show_stations      = traitlets.Bool(True).tag(sync=True)
+    # &hellip; plus cg_row_names / cg_col_names / matrix_slice_request_out, for jsdlink.</pre>
+  <p>
+    Everything <code>tag(sync=True)</code> is mirrored into the front-end model, and any
+    JS-side <code>model.set(&hellip;)</code> call mirrors right back to Python. The JS
+    bundle (<code>js/bike_flow_map_widget.mjs</code>, built with esbuild into
+    <code>widget.js</code>) does all the rendering and interaction. The Python class
+    almost never has to touch that state — the one Python-side observer is
+    <code>matrix_slice_request_out</code>, which forwards map click requests into
+    Celldega&apos;s <code>matrix_slice_request</code> traitlet.
+  </p>
+
+  <h3>Celldega Clustergram</h3>
+  <p>
+    Celldega&apos;s <code>viz.Clustergram</code> is a much larger widget — heatmap,
+    dendrograms, row/col manual category bars, row/col axis sliders. It emits a handful
+    of Python-observable events that we care about, all via a single
+    <code>click_info</code> traitlet that holds a <code>{type, value}</code> payload:
+  </p>
+  <ul>
+    <li><code>row_label</code> / <code>col_label</code> — clicked a station axis label</li>
+    <li><code>mat_value</code> — clicked a matrix cell (two stations + a probability)</li>
+    <li><code>row_dendro</code> / <code>col_dendro</code> — selected a dendrogram branch</li>
+    <li><code>cat_value</code> — clicked a manual category bar entry</li>
+  </ul>
+  <p>
+    Plus <code>matrix_axis_slice</code>, which returns a sorted top-<em>k</em> slice of
+    the matrix for a given row or column — this is what we use to draw the flow lines
+    when a station is clicked, without having to ship the whole probability matrix to
+    the browser.
+  </p>
+</section>
+
+<section id="linkage">
+  <h2>4. Clustergram &rarr; map linkage</h2>
+  <p>
+    Python never runs during a user interaction — all linkage is client-side. The wiring
+    lives in one small helper:
+  </p>
+<pre>def link_flow_to_clustergram(flow, cgm):
+    jsdlink((cgm, "click_info"),         (flow, "click_info"))
+    jsdlink((cgm, "selected_rows"),      (flow, "selected_rows"))
+    jsdlink((cgm, "selected_cols"),      (flow, "selected_cols"))
+    jsdlink((cgm, "matrix_axis_slice"),  (flow, "matrix_axis_slice"))
+    jsdlink((cgm, "row_names"),          (flow, "cg_row_names"))
+    jsdlink((cgm, "col_names"),          (flow, "cg_col_names"))
+    jsdlink((flow, "matrix_slice_request_out"), (cgm, "matrix_slice_request"))</pre>
+  <p>
+    <code>jsdlink</code> is ipywidgets&apos; &ldquo;JavaScript-side directional link&rdquo;: it
+    registers a front-end listener that copies one widget&apos;s traitlet to another&apos;s
+    without a kernel round-trip. When the Clustergram pushes a new
+    <code>click_info</code>, our widget&apos;s <code>change:click_info</code> handler fires
+    within the same animation frame.
+  </p>
+  <p>
+    Direction: overwhelmingly <em>Clustergram &rarr; flow map</em>. The one reverse
+    channel is <code>matrix_slice_request_out</code>: clicking a station on the map
+    asks the Clustergram to return a row-and-column slice for that station, which then
+    comes back as <code>matrix_axis_slice</code> and drives the flow lines.
+  </p>
+</section>
+
+<section id="store">
+  <h2>5. Observable store on the JS side</h2>
+  <p>
+    The map widget&apos;s frontend is a small hand-rolled reactive store — essentially
+    a tree of one-line observables rather than React/Redux. Each slot has
+    <code>get()</code>, <code>set(newValue)</code>, and <code>subscribe(fn)</code>; setters
+    skip no-op updates, and subscribers get the immediate value when they register
+    (opt-in):
+  </p>
+<pre>const Observable = (initialValue) =&gt; {
+  let value = initialValue;
+  const subscribers = new Set();
+  return {
+    get: () =&gt; value,
+    set: (v) =&gt; { if (value === v) return; value = v; subscribers.forEach((fn) =&gt; fn(v)); },
+    subscribe: (fn, { immediate = true } = {}) =&gt; {
+      subscribers.add(fn);
+      if (immediate) fn(value);
+      return () =&gt; subscribers.delete(fn);
+    },
+  };
+};</pre>
+  <p>
+    The store is created once per <code>render()</code> call and holds both
+    <em>mirrors of Python traitlets</em> (<code>stations</code>, <code>click_info</code>,
+    <code>cluster_polygons</code>, <code>spatial_mix</code>, <code>alpha_index</code>, &hellip;)
+    and <em>derived / pure-JS state</em> (<code>focus</code>, <code>highlights</code>,
+    <code>edges</code>, <code>hovered_cluster</code>, <code>pinned_cluster</code>).
+  </p>
+  <p>
+    All writes are batched into a single <code>requestAnimationFrame</code> via
+    <code>scheduleRender()</code>, which runs a 3-step pipeline:
+  </p>
+  <ol>
+    <li>
+      <strong>inputs synced</strong> &mdash; the Python-side traitlets have already been
+      copied into the store by <code>model.on(&quot;change:&hellip;&quot;)</code> handlers.
+    </li>
+    <li>
+      <strong>compute derived state</strong> &mdash; <code>computeStateFromInputs()</code>
+      inspects <code>click_info.type</code> and the axis-slice traitlets to decide what
+      the map should show: focus station, a list of highlights, and the
+      <code>edges</code> array. This is where a <code>row_label</code> click becomes
+      &ldquo;station N is the focus, 24 top-neighbor edges go in/out&rdquo;.
+    </li>
+    <li>
+      <strong>prepare deck props</strong> &mdash; <code>buildLayers()</code> produces the
+      layer array and then either boots a new <code>Deck</code> instance or calls
+      <code>deck.setProps(&hellip;)</code> to update an existing one.
+    </li>
+  </ol>
+  <p>
+    A small state machine (<code>deck_check: {inputs, computed, layers}</code>) gates the
+    actual <code>setProps</code> call, so updates triggered by multiple traitlet changes
+    in the same tick produce <em>one</em> redraw, not three.
+  </p>
+</section>
+
+<section id="layers">
+  <h2>6. deck.gl layer stack &amp; picking</h2>
+  <p>
+    <code>buildLayers()</code> returns these, in order &mdash; later layers render on top:
+  </p>
+  <ol>
+    <li>
+      <strong>basemap</strong> (<code>TileLayer + BitmapLayer</code>) &mdash; Carto light
+      tiles. Its alpha lerps to 0 as <code>spatial_mix</code> &rarr; 1, so the basemap
+      fades out when we morph into UMAP space (where geographic tiles would be nonsense).
+    </li>
+    <li>
+      <strong>alpha-shape polygons</strong> (<code>PolygonLayer</code>) &mdash; one ring
+      per cluster, stroked + filled. Border carries the emphasis (width &rarr; 3.2 px and
+      alpha &rarr; 245 when hovered or pinned); fill stays light so station dots inside
+      stay readable. See <a href="#nbhd">§7</a>.
+    </li>
+    <li>
+      <strong>flow lines</strong> (<code>LineLayer</code>) &mdash; the user&apos;s current
+      <code>edges</code> array. Width is proportional to <code>sqrt(probability)</code>;
+      color depends on direction (red = outbound, blue = inbound, near-black = a single
+      <code>mat_value</code> cell click so it reads against any basemap).
+    </li>
+    <li>
+      <strong>station scatter</strong> (<code>ScatterplotLayer</code>) &mdash; one dot per
+      station, radius in meters so zoom drives pixel size, fill color by cluster. Focus
+      hub and linked stations get scaled up based on their share of flow.
+    </li>
+  </ol>
+  <p>
+    Picking follows the draw order: station dots win over polygons, so clicking a station
+    behaves the same whether or not a neighborhood is drawn underneath it. The polygon
+    layer disables picking entirely once <code>spatial_mix</code> is past roughly 0.5
+    (i.e. the layer is almost invisible anyway) to stop hover events from registering on
+    a ghost region.
+  </p>
+</section>
+
+<section id="nbhd">
+  <h2>7. Alpha-shape neighborhoods</h2>
+  <p>
+    The polygons come from <code>celldega.nbhd.alpha_shape</code>, which is a thin
+    wrapper over <code>libpysal</code>&apos;s alpha-shape implementation. Input is a
+    point cloud; output is a <code>MultiPolygon</code> that approximates the &ldquo;tight
+    concave hull&rdquo; of those points, parameterized by an inverse-radius &alpha; (smaller
+    = more filigree, larger = closer to the convex hull).
+  </p>
+
+  <h3>Projection</h3>
+  <p>
+    libpysal uses euclidean distance on the input coordinates, so if you pass raw
+    (lng, lat) you&apos;re implicitly working in degrees &mdash; useless for &ldquo;radius
+    in miles&rdquo;. <code>nbhd.compute_cluster_alpha_shapes</code> runs each city&apos;s
+    stations through a local equirectangular projection centered on the mean station,
+    converting to meters, runs the alpha shape with &alpha;<sup>&minus;1</sup> = <em>r</em>
+    &times; 1609.34, and uses a rounded-meter lookup table to map output vertices back
+    to both their original (lng, lat) <em>and</em> their UMAP coords.
+  </p>
+
+  <h3>Precomputation</h3>
+  <p>
+    Ten log-spaced radii from 0.05 mi (block scale) to 5 mi (cross-borough) are
+    precomputed per cluster at notebook-build time. The payload is a single dict:
+  </p>
+<pre>{
+  "levels_miles": [0.05, 0.084, 0.140, &hellip;, 5.0],
+  "polygons": [
+    {"cluster_id": 1, "by_level": [
+      [{"geo": [[lng,lat],&hellip;], "umap": [[lng,lat],&hellip;]}, &hellip;],   # level 0
+      &hellip;
+    ]},
+    &hellip;
+  ]
+}</pre>
+  <p>
+    Coords are rounded to 5 decimals (&asymp;1 m precision). For a typical city
+    (150 clusters, avg 15-vertex polygons, 10 levels) that&apos;s well under 200 KB of
+    JSON, which embeds comfortably into the standalone widget HTMLs. A binary-buffer
+    encoding via anywidget is a drop-in replacement if we ever need to go further.
+  </p>
+
+  <h3>Flicker fix: layer id per resolution</h3>
+  <p>
+    The NBHD slider is a pure front-end control — it just changes
+    <code>store.alpha_index</code>. Originally the <code>PolygonLayer</code> had a
+    constant <code>id</code> and relied on <code>updateTriggers</code> to swap the
+    <code>getPolygon</code> accessor. Unfortunately that tells deck.gl
+    &ldquo;the same layer, new geometry&rdquo; — which makes it try to interpolate
+    attribute transitions across vertex buffers of wildly different sizes, causing a
+    flicker at every slider step. Fix: include <code>alphaIdx</code> in the layer id.
+    A resolution change is now a full layer swap; the transitions we do want (hover
+    color/width) still run smoothly within a single resolution.
+  </p>
+</section>
+
+<section id="umap">
+  <h2>8. Spatial &harr; UMAP morph</h2>
+  <p>
+    Each station ships with both a <code>(lng, lat)</code> pair and a
+    <code>(umap_lng, umap_lat)</code> pair (centered on the geographic centroid so the
+    two frames overlay). A single <code>spatial_mix</code> float in [0, 1] drives
+    everything:
+  </p>
+<pre>// in buildLayers()
+const t = spatialMix;
+for (const s of stations) {
+  const lng = Number(s.lng) * (1 - t) + (Number(s.umap_lng) + dLng) * t;
+  const lat = Number(s.lat) * (1 - t) + (Number(s.umap_lat) + dLat) * t;
+  posLookup[s.name] = [lng, lat];
+}</pre>
+  <p>
+    Flow lines read the same <code>posLookup</code> so endpoints follow. Alpha-shape
+    polygons morph vertex-by-vertex using the geo&harr;UMAP lookup we built at
+    precomputation time &mdash; no alpha shape is ever computed in UMAP space, we just
+    drag the existing vertices along with their stations. The polygon layer&apos;s alpha
+    fades to 0 by <code>spatial_mix = 1</code> because a geo alpha shape loses meaning
+    once it&apos;s warped.
+  </p>
+  <p>
+    The basemap likewise fades out, and the map area&apos;s CSS background lerps from a
+    tile-matching grey to pure white so the UMAP view ends up on a clean canvas.
+  </p>
+</section>
+
+<section id="static">
+  <h2>9. Building the static HTMLs</h2>
+  <p>
+    Two notebook-driven pipelines produce the artifacts shipped alongside
+    <code>index.html</code>:
+  </p>
+  <ol>
+    <li>
+      <code>build_htmls.ipynb</code> runs each city notebook via
+      <code>nbconvert.ExecutePreprocessor</code> then exports to a full
+      <code>&lt;City&gt;.html</code> (code cells + outputs).
+    </li>
+    <li>
+      <code>build_widget_htmls.ipynb</code> generates a minimal per-city widget shell by
+      programmatically building a single-code-cell notebook that invokes
+      <code>make_flow_widget</code> + <code>link_flow_to_clustergram</code>, runs it,
+      then exports via <code>HTMLExporter</code> with <code>exclude_input</code>. The
+      result is a self-contained <code>&lt;City&gt;_widget.html</code> with just the
+      HBox of the flow map + clustergram &mdash; that&apos;s what the iframe on the
+      landing page loads.
+    </li>
+  </ol>
+  <blockquote>
+    We initially tried <code>ipywidgets.embed_minimal_html</code> and hit an
+    incompatibility with anywidget&apos;s ES-module bundling (<code>embed-amd.js</code>
+    couldn&apos;t locate <code>anywidget.js</code> on disk). The nbconvert route
+    bundles anywidget&apos;s JS as a data URI into the notebook&apos;s output HTML, so
+    there&apos;s no runtime fetch and the page works from file:// URLs.
+  </blockquote>
+</section>
+
+<section id="future">
+  <h2>10. Known limits &amp; future work</h2>
+  <ul>
+    <li>
+      <strong>No Clustergram hover linkage.</strong> Celldega&apos;s Clustergram keeps
+      hover state (<code>hovered_cat</code>) purely in its own JS store; it never pushes
+      to a Python traitlet. Only clicks make it across. Adding a hover traitlet upstream
+      is an obvious improvement.
+    </li>
+    <li>
+      <strong>Alpha shapes are computed per cluster, not jointly.</strong> Overlapping
+      clusters produce overlapping polygons. A constrained Voronoi or nested containment
+      scheme would clean that up.
+    </li>
+    <li>
+      <strong>UMAP is recomputed at build time.</strong> The embedding&apos;s random
+      initialization means rebuilds can subtly reshuffle the UMAP layout; we&apos;d want
+      a fixed seed or a saved embedding to stabilize publication-quality outputs.
+    </li>
+    <li>
+      <strong>Flow lines cap at top-<em>k</em>.</strong> The map asks the Clustergram
+      for a top-25 slice by design &mdash; a dense city can easily have 200+ non-trivial
+      targets from a single station. A &ldquo;show all&rdquo; mode with
+      <code>ArcLayer</code> and alpha-by-probability would be a nice addition.
+    </li>
+    <li>
+      <strong>Widget-only HTML is ~1.5 MB</strong> per city, dominated by the deck.gl +
+      anywidget bundles. Moving to a shared CDN import, or lazy-loading the map/cgm
+      bundles, would trim it significantly.
+    </li>
+  </ul>
+</section>
+
+<footer>
+  <p>
+    Sources:
+    <a href="https://github.com/broadinstitute/celldega/tree/bikes/notebooks">notebooks &amp; widget source</a> &middot;
+    <a href="https://anywidget.dev/">anywidget</a> &middot;
+    <a href="https://deck.gl/">deck.gl</a> &middot;
+    <a href="https://github.com/broadinstitute/celldega">Celldega</a>.
+    <a href="index.html">Back to overview &rarr;</a>
+  </p>
+</footer>
+
+</main>
+</body>
+</html>
