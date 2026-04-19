@@ -45287,6 +45287,9 @@ var createStore = () => ({
   transition_topk: Observable({}),
   station_outflow: Observable({}),
   show_rides: Observable(true),
+  // Slider-driven count of simultaneously animated rides. Drives the
+  // ambient pool size directly via `targetRidesPoolSize`. Range [1, 20000].
+  n_rides: Observable(1e4),
   current_time: Observable(0)
 });
 var log3 = (store, ...args) => {
@@ -45483,19 +45486,29 @@ function flowBlendWithAlpha(outW, inW, alpha) {
   const [r2, g2, b2] = flowBlendRgb(outW, inW);
   return [r2, g2, b2, alpha];
 }
-var RIDES_PER_STATION = 2;
-var RIDES_POOL_MIN = 400;
-var RIDES_POOL_MAX = 5e3;
+var N_RIDES_MIN = 1;
+var N_RIDES_MAX = 2e4;
+var N_RIDES_DEFAULT = 1e4;
 var RIDES_FOCUSED_FRACTION = 0.1;
 var RIDES_FOCUSED_MIN = 50;
-function targetRidesPoolSize(numStations, focused = false) {
-  const n2 = Math.round(Number(numStations) || 0);
-  const ambient = Math.max(
-    RIDES_POOL_MIN,
-    Math.min(RIDES_POOL_MAX, Math.round(n2 * RIDES_PER_STATION) || RIDES_POOL_MIN)
+var NARROW_FOCUS_KINDS = /* @__PURE__ */ new Set(["station", "mat_cell"]);
+function targetRidesPoolSize(nRides, kind, focusCtx, totalStations) {
+  const n2 = Math.max(
+    N_RIDES_MIN,
+    Math.min(N_RIDES_MAX, Math.round(Number(nRides) || N_RIDES_DEFAULT))
   );
-  if (!focused) return ambient;
-  return Math.max(RIDES_FOCUSED_MIN, Math.round(ambient * RIDES_FOCUSED_FRACTION));
+  if (NARROW_FOCUS_KINDS.has(kind)) {
+    return Math.max(RIDES_FOCUSED_MIN, Math.round(n2 * RIDES_FOCUSED_FRACTION));
+  }
+  if (focusCtx && (focusCtx.mode === "col_dendro" || focusCtx.mode === "row_dendro")) {
+    const selSize = focusCtx.mode === "col_dendro" ? focusCtx.origin?.names?.length || 0 : focusCtx.dest?.names?.length || 0;
+    const total = Math.max(1, Number(totalStations) || 0);
+    if (selSize > 0) {
+      const frac = Math.min(1, selSize / total);
+      return Math.max(RIDES_FOCUSED_MIN, Math.round(n2 * frac));
+    }
+  }
+  return n2;
 }
 var RIDE_MS_PER_DEG = 18e4;
 var RIDE_SEG_VEL_JITTER = 0.18;
@@ -45872,15 +45885,15 @@ function render({ model, el }) {
   const root = document.createElement("div");
   root.style.cssText = "background:#e2e4e8;border-radius:4px;overflow:hidden;display:flex;flex-direction:column;";
   el.appendChild(root);
-  const TOPBAR_ROW_HEIGHT = 26;
-  const TOGGLE_BUTTON_HEIGHT = 20;
-  const TOPBAR_HEIGHT = 76;
+  const TOPBAR_ROW_HEIGHT = 20;
+  const TOGGLE_BUTTON_HEIGHT = 18;
+  const TOPBAR_HEIGHT = 78;
   const topbar = document.createElement("div");
-  topbar.style.cssText = "flex:0 0 auto;height:" + TOPBAR_HEIGHT + "px;box-sizing:border-box;display:flex;flex-direction:row;align-items:stretch;gap:14px;padding:6px 12px;background:#f5f6f8;border-bottom:1px solid #d0d3d8;font:12px system-ui,sans-serif;color:#333;user-select:none;";
+  topbar.style.cssText = "flex:0 0 auto;height:" + TOPBAR_HEIGHT + "px;box-sizing:border-box;display:flex;flex-direction:row;align-items:stretch;gap:12px;padding:4px 10px;background:#f5f6f8;border-bottom:1px solid #d0d3d8;font:12px system-ui,sans-serif;color:#333;user-select:none;";
   root.appendChild(topbar);
   const makeColumn = (flex) => {
     const col = document.createElement("div");
-    col.style.cssText = "display:flex;flex-direction:column;justify-content:space-between;gap:4px;flex:" + flex + ";min-width:0;";
+    col.style.cssText = "display:flex;flex-direction:column;justify-content:space-between;gap:2px;flex:" + flex + ";min-width:0;";
     topbar.appendChild(col);
     return col;
   };
@@ -45925,29 +45938,22 @@ function render({ model, el }) {
   colToggles.appendChild(makeToggle("NBHD", store.show_neighborhoods, "show_neighborhoods"));
   colToggles.appendChild(makeToggle("Stations", store.show_stations, "show_stations"));
   colToggles.appendChild(makeToggle("Rides", store.show_rides, "show_rides"));
-  const STATION_LABEL_W = 78;
-  const NBHD_LABEL_W = 50;
-  const VALUE_W = 48;
-  const makeSliderRow = (label, { labelWidth = STATION_LABEL_W, showValue = true }) => {
+  const SLIDER_LABEL_W = 88;
+  const SLIDER_INPUT_W = 120;
+  const makeSliderRow = (label) => {
     const row = document.createElement("div");
-    row.style.cssText = "display:flex;align-items:center;gap:8px;height:" + TOPBAR_ROW_HEIGHT + "px;min-width:0;";
+    row.style.cssText = "display:flex;align-items:center;gap:6px;height:" + TOPBAR_ROW_HEIGHT + "px;min-width:0;";
     const labEl = document.createElement("span");
-    labEl.style.cssText = "color:#444;font-weight:500;white-space:nowrap;flex:0 0 " + labelWidth + "px;";
+    labEl.style.cssText = "color:#444;font-weight:500;white-space:nowrap;flex:0 0 " + SLIDER_LABEL_W + "px;";
     labEl.textContent = label;
     const inp = document.createElement("input");
     inp.type = "range";
-    inp.style.cssText = "flex:1 1 auto;min-width:50px;max-width:160px;cursor:pointer;";
+    inp.style.cssText = "flex:0 0 " + SLIDER_INPUT_W + "px;width:" + SLIDER_INPUT_W + "px;cursor:pointer;margin:0;";
     row.appendChild(labEl);
     row.appendChild(inp);
-    let valEl = null;
-    if (showValue) {
-      valEl = document.createElement("span");
-      valEl.style.cssText = "color:#666;font-variant-numeric:tabular-nums;flex:0 0 " + VALUE_W + "px;text-align:right;white-space:nowrap;";
-      row.appendChild(valEl);
-    }
-    return { row, input: inp, valEl };
+    return { row, input: inp, valEl: null };
   };
-  const spatial = makeSliderRow("Spatial \u2194 UMAP", { labelWidth: STATION_LABEL_W });
+  const spatial = makeSliderRow("Spatial \u2194 UMAP");
   spatial.input.min = "0";
   spatial.input.max = "1";
   spatial.input.step = "0.01";
@@ -45964,7 +45970,7 @@ function render({ model, el }) {
     const hasUmap = stations.some((s2) => s2.umap_lng != null && s2.umap_lat != null);
     spatial.row.style.visibility = hasUmap ? "visible" : "hidden";
   }, { immediate: true });
-  const sizeRow = makeSliderRow("Size", { labelWidth: STATION_LABEL_W, showValue: false });
+  const sizeRow = makeSliderRow("Size");
   sizeRow.input.min = "0.4";
   sizeRow.input.max = "2.5";
   sizeRow.input.step = "0.05";
@@ -45978,12 +45984,11 @@ function render({ model, el }) {
     sizeRow.row.style.opacity = on ? "1" : "0.4";
     sizeRow.input.disabled = !on;
   }, { immediate: true });
-  const radiusRow = makeSliderRow("Radius", { labelWidth: NBHD_LABEL_W });
+  const radiusRow = makeSliderRow("Radius");
   radiusRow.input.min = "0";
   radiusRow.input.max = "0";
   radiusRow.input.step = "1";
   radiusRow.input.value = "0";
-  const formatMiles = (mi) => mi < 0.1 ? `${(mi * 5280).toFixed(0)} ft` : `${mi.toFixed(2)} mi`;
   const refreshNbhdSlider = () => {
     const cp = store.cluster_polygons.get() || {};
     const levels = Array.isArray(cp.levels_miles) ? cp.levels_miles : [];
@@ -45995,7 +46000,6 @@ function render({ model, el }) {
     radiusRow.input.max = String(levels.length - 1);
     const idx = Math.max(0, Math.min(levels.length - 1, store.alpha_index.get() | 0));
     radiusRow.input.value = String(idx);
-    radiusRow.valEl.textContent = formatMiles(Number(levels[idx]) || 0);
   };
   radiusRow.input.addEventListener("input", () => {
     const idx = parseInt(radiusRow.input.value, 10) | 0;
@@ -46012,7 +46016,7 @@ function render({ model, el }) {
     radiusRow.row.style.opacity = on ? "1" : "0.4";
     radiusRow.input.disabled = !on;
   }, { immediate: true });
-  const opacityRow = makeSliderRow("Opacity", { labelWidth: NBHD_LABEL_W, showValue: false });
+  const opacityRow = makeSliderRow("Opacity");
   opacityRow.input.min = "0";
   opacityRow.input.max = "1";
   opacityRow.input.step = "0.05";
@@ -46025,6 +46029,27 @@ function render({ model, el }) {
   store.show_neighborhoods.subscribe((on) => {
     opacityRow.row.style.opacity = on ? "1" : "0.4";
     opacityRow.input.disabled = !on;
+  }, { immediate: true });
+  const ridesCountRow = makeSliderRow("Rides");
+  ridesCountRow.input.min = String(N_RIDES_MIN);
+  ridesCountRow.input.max = String(N_RIDES_MAX);
+  ridesCountRow.input.step = "200";
+  const refreshRidesCountSlider = () => {
+    const v2 = Math.max(N_RIDES_MIN, Math.min(N_RIDES_MAX, Number(store.n_rides.get()) | 0));
+    ridesCountRow.input.value = String(v2);
+  };
+  ridesCountRow.input.addEventListener("input", () => {
+    const v2 = Math.max(N_RIDES_MIN, Math.min(N_RIDES_MAX, parseInt(ridesCountRow.input.value, 10) | 0));
+    store.n_rides.set(v2);
+    model.set("n_rides", v2);
+    model.save_changes();
+    scheduleRender();
+  });
+  colStation.appendChild(ridesCountRow.row);
+  store.n_rides.subscribe(refreshRidesCountSlider, { immediate: true });
+  store.show_rides.subscribe((on) => {
+    ridesCountRow.row.style.opacity = on ? "1" : "0.4";
+    ridesCountRow.input.disabled = !on;
   }, { immediate: true });
   store.spatial_mix.subscribe((mix) => {
     const t2 = Math.max(0, Math.min(1, Number(mix) || 0));
@@ -46371,6 +46396,9 @@ function render({ model, el }) {
     refillRides(ridesPool, ridesSampler, focus || null, posLookup, palRgb, stationCluster, focusCtx);
     ridesFrame += 1;
     const ridesAlpha = Math.round(220 * Math.max(0, 1 - spatialMix));
+    const RIDES_STROKE_MODES = /* @__PURE__ */ new Set(["col_dendro", "row_dendro"]);
+    const stroked = Boolean(focusCtx && RIDES_STROKE_MODES.has(focusCtx.mode));
+    const strokeAlpha = Math.round(180 * Math.max(0, 1 - spatialMix));
     return new scatterplot_layer_default({
       id: "bike-rides",
       data: ridesPool,
@@ -46385,13 +46413,19 @@ function render({ model, el }) {
         const c2 = d2.color;
         return [c2[0], c2[1], c2[2], ridesAlpha];
       },
-      stroked: false,
+      stroked,
+      lineWidthUnits: "pixels",
+      lineWidthMinPixels: stroked ? 0.6 : 0,
+      getLineWidth: stroked ? 0.8 : 0,
+      getLineColor: [55, 60, 70, strokeAlpha],
       // Position changes every frame; bump trigger every frame so deck.gl
       // re-runs the accessor. Other accessors only invalidate on hops,
       // focus/sampler swaps, or palette changes.
       updateTriggers: {
         getPosition: ridesFrame,
-        getFillColor: [ridesFrame, palRgb, ridesAlpha]
+        getFillColor: [ridesFrame, palRgb, ridesAlpha],
+        getLineColor: [stroked, strokeAlpha],
+        getLineWidth: stroked
       }
     });
   };
@@ -46760,7 +46794,10 @@ function render({ model, el }) {
         posLookup
       }) : null;
       const isFocused = Boolean(focusCtx);
-      resizeRidesPool(targetRidesPoolSize(stations.length, isFocused));
+      const nRidesSlider = Number(store.n_rides.get());
+      resizeRidesPool(
+        targetRidesPoolSize(nRidesSlider, selectionKind, focusCtx, stations.length)
+      );
       ensureSampler(transitionTopk, stationOutflow);
       flushRidesForSelectionChange(selectionKind, focus, focusCtx);
       ridesCtx = {
@@ -46893,6 +46930,7 @@ function render({ model, el }) {
     store.transition_topk,
     store.station_outflow,
     store.show_rides,
+    store.n_rides,
     store.selection_kind
   ].forEach((obs) => obs.subscribe(() => scheduleRender(), { immediate: false }));
   let ridesRaf = 0;
@@ -46949,6 +46987,10 @@ function render({ model, el }) {
     store.show_neighborhoods.set(Boolean(model.get("show_neighborhoods") ?? true));
     store.show_stations.set(Boolean(model.get("show_stations") ?? true));
     store.show_rides.set(Boolean(model.get("show_rides") ?? true));
+    const nr = Number(model.get("n_rides"));
+    store.n_rides.set(
+      Number.isFinite(nr) ? Math.max(N_RIDES_MIN, Math.min(N_RIDES_MAX, nr | 0)) : N_RIDES_DEFAULT
+    );
     const tk = model.get("transition_topk") || {};
     store.transition_topk.set(tk && typeof tk === "object" ? tk : {});
     const so = model.get("station_outflow") || {};
@@ -46981,6 +47023,7 @@ function render({ model, el }) {
     "show_neighborhoods",
     "show_stations",
     "show_rides",
+    "n_rides",
     "transition_topk",
     "station_outflow"
   ].forEach((name2) => model.on(`change:${name2}`, syncFromModel));

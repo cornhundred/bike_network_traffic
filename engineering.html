@@ -612,12 +612,23 @@ station_outflow = traitlets.Dict({}).tag(sync=True)</pre>
     full but <em>chain continuation is disabled</em> in every focused mode.
   </p>
   <p>
-    The pool also <em>shrinks</em> when entering focused mode:
-    <code>targetRidesPoolSize(numStations, focused = true)</code> returns
-    <code>~10%</code> of the ambient size (with a floor of 50), so the simulation
-    doesn&apos;t drown out the line geometry when restricted to a single station&apos;s
-    neighbourhood, a single cell&apos;s flow, or a small dendro selection. NYC drops
-    from ~4000 to ~400 walkers; Boston from ~800 to ~80 (clamped to 50 minimum).
+    Pool size is computed by
+    <code>targetRidesPoolSize(nRides, kind, focusCtx, totalStations)</code> with
+    three regimes. <em>Narrow</em> selections (single station, matrix cell)
+    return <code>max(50, round(nRides &times; 0.10))</code> &mdash; a one-station
+    view doesn&apos;t need 10k walkers and the dense swarm would obscure the
+    in/out lines. <em>Dendrogram &amp; category</em> selections scale linearly
+    by <code>selection_size / total_stations</code>, floored at 50: per-station
+    ride density stays constant whether you click a 30-station cluster or a
+    300-station one. <em>Ambient</em> (no focus) returns the full slider value.
+    With the slider at the default 10k and ~2000 NYC stations, a 200-station
+    cluster animates ~1000 walkers, a 30-station cluster ~150.
+  </p>
+  <p>
+    Dendro and category selections also opt in to a thin dark-grey stroke around
+    each ride (<code>stroked: true</code>, ~0.8&nbsp;px line width) because the
+    cluster palette includes light yellows / mints that disappear against the
+    basemap when rendered as flat dots.
   </p>
   <p>
     Switching between selections (or back to ambient) flushes the pool via

@@ -37,6 +37,14 @@ class BikeFlowMapWidget(anywidget.AnyWidget):
     show_neighborhoods = traitlets.Bool(True).tag(sync=True)
     show_stations = traitlets.Bool(True).tag(sync=True)
     show_rides = traitlets.Bool(True).tag(sync=True)
+    # Number of simultaneously animated bike rides in the ambient
+    # (no selection) state. Driven by the topbar "Rides" slider; 1..20000.
+    # When the user makes a *narrow* selection (single station or matrix
+    # cell), the JS side scales this down to ~10% so the rides don't
+    # drown out the in/out lines. *Dendrogram / category* selections
+    # scale by selection_size / total_stations, so per-station ride
+    # density stays constant whether the cluster is large or small.
+    n_rides = traitlets.Int(10000).tag(sync=True)
 
     # Sparse top-K destination distribution per origin station. The JS-side
     # ride simulator samples from this to animate ~1000 simultaneous bike

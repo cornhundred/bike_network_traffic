@@ -79,6 +79,9 @@ const createStore = () => ({
   transition_topk: Observable({}),
   station_outflow: Observable({}),
   show_rides: Observable(true),
+  // Slider-driven count of simultaneously animated rides. Drives the
+  // ambient pool size directly via `targetRidesPoolSize`. Range [1, 20000].
+  n_rides: Observable(10000),
   current_time: Observable(0),
 });
 
@@ -289,29 +292,45 @@ function flowBlendWithAlpha(outW, inW, alpha) {
 // driven; Python only ships the sparse top-K table once at widget
 // creation so this works in fully static HTML embeds.
 
-// The ride pool sizes itself per city: ~2 walkers per station, clamped
-// to a comfortable range. NYC's ~2000 stations -> ~4000 rides; Boston's
-// ~400 -> ~800; DC ~700 -> ~1400; Chicago ~900 -> ~1800. The cap keeps
-// the per-frame interpolation loop under a few ms even on dense
-// systems, while the floor guarantees a visible swarm in small cities.
-const RIDES_PER_STATION = 2.0;
-const RIDES_POOL_MIN = 400;
-const RIDES_POOL_MAX = 5000;
-// When the user selects a station / row / column / cell we shrink the
-// pool to ~10% of the ambient size — the simulation is now restricted
-// to one station's neighbourhood (or one direction, or one cell), so
-// the same ride density would actually obscure the geometry. A small
-// floor keeps a focused selection on a tiny city visibly animated.
+// Ride pool sizing. The user-facing "Rides" slider (1..N_RIDES_MAX,
+// default N_RIDES_DEFAULT) sets the ambient pool size directly via the
+// `n_rides` traitlet. Three selection regimes:
+//
+//   - narrow ('station' / 'mat_cell'): shrink to RIDES_FOCUSED_FRACTION
+//     of the slider value (floor RIDES_FOCUSED_MIN). A one-station view
+//     doesn't need 10k walkers and the dense swarm would obscure the
+//     in/out lines.
+//   - dendro / category ('col_dendro' / 'row_dendro' / 'cat_value'):
+//     scale linearly by selection_size / total_stations. Selecting all
+//     stations behaves like ambient; selecting a small cluster gets a
+//     proportionally small swarm (so per-station ride density stays
+//     constant whether you click a big or small group).
+//   - ambient (no focus): full slider value.
+const N_RIDES_MIN = 1;
+const N_RIDES_MAX = 20000;
+const N_RIDES_DEFAULT = 10000;
 const RIDES_FOCUSED_FRACTION = 0.10;
 const RIDES_FOCUSED_MIN = 50;
-function targetRidesPoolSize(numStations, focused = false) {
-  const n = Math.round(Number(numStations) || 0);
-  const ambient = Math.max(
-    RIDES_POOL_MIN,
-    Math.min(RIDES_POOL_MAX, Math.round(n * RIDES_PER_STATION) || RIDES_POOL_MIN),
+const NARROW_FOCUS_KINDS = new Set(['station', 'mat_cell']);
+function targetRidesPoolSize(nRides, kind, focusCtx, totalStations) {
+  const n = Math.max(
+    N_RIDES_MIN,
+    Math.min(N_RIDES_MAX, Math.round(Number(nRides) || N_RIDES_DEFAULT)),
   );
-  if (!focused) return ambient;
-  return Math.max(RIDES_FOCUSED_MIN, Math.round(ambient * RIDES_FOCUSED_FRACTION));
+  if (NARROW_FOCUS_KINDS.has(kind)) {
+    return Math.max(RIDES_FOCUSED_MIN, Math.round(n * RIDES_FOCUSED_FRACTION));
+  }
+  if (focusCtx && (focusCtx.mode === 'col_dendro' || focusCtx.mode === 'row_dendro')) {
+    const selSize = focusCtx.mode === 'col_dendro'
+      ? (focusCtx.origin?.names?.length || 0)
+      : (focusCtx.dest?.names?.length || 0);
+    const total = Math.max(1, Number(totalStations) || 0);
+    if (selSize > 0) {
+      const frac = Math.min(1, selSize / total);
+      return Math.max(RIDES_FOCUSED_MIN, Math.round(n * frac));
+    }
+  }
+  return n;
 }
 // Per-segment timing. We use a *constant velocity* model: every ride
 // covers the same number of degrees per millisecond on screen, so a
@@ -852,17 +871,20 @@ function render({ model, el }) {
   // Grouping by domain (toggles vs station-related sliders vs nbhd-related
   // sliders) keeps related controls visually adjacent and lets each row
   // share a consistent label width within its column.
-  const TOPBAR_ROW_HEIGHT = 26;
+  const TOPBAR_ROW_HEIGHT = 20;
   // Buttons are smaller than slider rows — a slider needs vertical room
   // for its thumb, a button doesn't. Toggle column has 3 stacked
-  // buttons; slider columns have 2 slider rows distributed top/bottom
-  // via justify-content: space-between.
-  const TOGGLE_BUTTON_HEIGHT = 20;
-  const TOPBAR_HEIGHT = 76;
+  // buttons; slider columns now hold up to 3 rows (Spatial↔UMAP / Size /
+  // Rides in the station column; Radius / Opacity in the NBHD column).
+  // The topbar is sized to fit 3 slider rows + gap + padding; the toggle
+  // column distributes its 3 buttons via justify-content: space-between
+  // so they spread evenly across the same height.
+  const TOGGLE_BUTTON_HEIGHT = 18;
+  const TOPBAR_HEIGHT = 78;
   const topbar = document.createElement('div');
   topbar.style.cssText =
     'flex:0 0 auto;height:' + TOPBAR_HEIGHT + 'px;box-sizing:border-box;' +
-    'display:flex;flex-direction:row;align-items:stretch;gap:14px;padding:6px 12px;' +
+    'display:flex;flex-direction:row;align-items:stretch;gap:12px;padding:4px 10px;' +
     'background:#f5f6f8;border-bottom:1px solid #d0d3d8;' +
     'font:12px system-ui,sans-serif;color:#333;user-select:none;';
   root.appendChild(topbar);
@@ -874,7 +896,7 @@ function render({ model, el }) {
     const col = document.createElement('div');
     col.style.cssText =
       'display:flex;flex-direction:column;justify-content:space-between;' +
-      'gap:4px;flex:' + flex + ';min-width:0;';
+      'gap:2px;flex:' + flex + ';min-width:0;';
     topbar.appendChild(col);
     return col;
   };
@@ -934,45 +956,36 @@ function render({ model, el }) {
   colToggles.appendChild(makeToggle('Stations', store.show_stations, 'show_stations'));
   colToggles.appendChild(makeToggle('Rides', store.show_rides, 'show_rides'));
 
-  // Slider rows share label/value column widths *within a section* so the
-  // range tracks line up vertically. Two label widths because the station
-  // section has a longer label than the nbhd section.
-  const STATION_LABEL_W = 78;  // fits "Spatial ↔ UMAP"
-  const NBHD_LABEL_W = 50;     // fits "Opacity"
-  const VALUE_W = 48;
+  // Every slider row uses the same label width and the same fixed
+  // input-track width so the bars line up perfectly across columns and
+  // visually read as a single switchboard. Label width is sized to the
+  // longest label ("Spatial ↔ UMAP"); shorter labels left-align inside.
+  const SLIDER_LABEL_W = 88;
+  const SLIDER_INPUT_W = 120;
 
-  // makeSliderRow: builds one horizontal row (label + range + optional value
-  // readout). Set `showValue: false` for cosmetic multiplier sliders where the
-  // exact number isn't useful (Size, Opacity); leave it on for Radius which
-  // shows a meaningful unit (mi/ft).
-  const makeSliderRow = (label, { labelWidth = STATION_LABEL_W, showValue = true }) => {
+  // makeSliderRow: a horizontal label + range row. No value readout —
+  // the slider position itself is the affordance for these cosmetic
+  // knobs (Size, Opacity, Rides count) and even Radius is fine without
+  // it since the user can see the polygon size change live.
+  const makeSliderRow = (label) => {
     const row = document.createElement('div');
     row.style.cssText =
-      'display:flex;align-items:center;gap:8px;height:' + TOPBAR_ROW_HEIGHT + 'px;min-width:0;';
+      'display:flex;align-items:center;gap:6px;height:' + TOPBAR_ROW_HEIGHT + 'px;min-width:0;';
     const labEl = document.createElement('span');
     labEl.style.cssText =
-      'color:#444;font-weight:500;white-space:nowrap;flex:0 0 ' + labelWidth + 'px;';
+      'color:#444;font-weight:500;white-space:nowrap;flex:0 0 ' + SLIDER_LABEL_W + 'px;';
     labEl.textContent = label;
     const inp = document.createElement('input');
     inp.type = 'range';
-    // Cap width so sliders don't stretch absurdly in wide iframes; they'll
-    // still shrink in narrow ones via flex-shrink.
-    inp.style.cssText = 'flex:1 1 auto;min-width:50px;max-width:160px;cursor:pointer;';
+    inp.style.cssText =
+      'flex:0 0 ' + SLIDER_INPUT_W + 'px;width:' + SLIDER_INPUT_W + 'px;cursor:pointer;margin:0;';
     row.appendChild(labEl);
     row.appendChild(inp);
-    let valEl = null;
-    if (showValue) {
-      valEl = document.createElement('span');
-      valEl.style.cssText =
-        'color:#666;font-variant-numeric:tabular-nums;flex:0 0 ' + VALUE_W + 'px;' +
-        'text-align:right;white-space:nowrap;';
-      row.appendChild(valEl);
-    }
-    return { row, input: inp, valEl };
+    return { row, input: inp, valEl: null };
   };
 
   // ---- Station column: Spatial ↔ UMAP morph (top), Station size (bottom) ----
-  const spatial = makeSliderRow('Spatial \u2194 UMAP', { labelWidth: STATION_LABEL_W });
+  const spatial = makeSliderRow('Spatial \u2194 UMAP');
   spatial.input.min = '0'; spatial.input.max = '1'; spatial.input.step = '0.01'; spatial.input.value = '0';
   const slider = spatial.input; // alias kept for downstream syncFromModel writer
   spatial.input.addEventListener('input', () => {
@@ -987,7 +1000,7 @@ function render({ model, el }) {
     spatial.row.style.visibility = hasUmap ? 'visible' : 'hidden';
   }, { immediate: true });
 
-  const sizeRow = makeSliderRow('Size', { labelWidth: STATION_LABEL_W, showValue: false });
+  const sizeRow = makeSliderRow('Size');
   sizeRow.input.min = '0.4'; sizeRow.input.max = '2.5'; sizeRow.input.step = '0.05';
   sizeRow.input.value = String(store.station_size_mult.get());
   sizeRow.input.addEventListener('input', () => {
@@ -1003,9 +1016,8 @@ function render({ model, el }) {
   // ---- NBHD column: alpha-shape Radius (top), Opacity (bottom) ----
   // Radius slider indexes into cluster_polygons.levels_miles. Hidden when
   // no neighborhoods are precomputed for this city.
-  const radiusRow = makeSliderRow('Radius', { labelWidth: NBHD_LABEL_W });
+  const radiusRow = makeSliderRow('Radius');
   radiusRow.input.min = '0'; radiusRow.input.max = '0'; radiusRow.input.step = '1'; radiusRow.input.value = '0';
-  const formatMiles = (mi) => (mi < 0.1 ? `${(mi * 5280).toFixed(0)} ft` : `${mi.toFixed(2)} mi`);
   const refreshNbhdSlider = () => {
     const cp = store.cluster_polygons.get() || {};
     const levels = Array.isArray(cp.levels_miles) ? cp.levels_miles : [];
@@ -1017,7 +1029,6 @@ function render({ model, el }) {
     radiusRow.input.max = String(levels.length - 1);
     const idx = Math.max(0, Math.min(levels.length - 1, store.alpha_index.get() | 0));
     radiusRow.input.value = String(idx);
-    radiusRow.valEl.textContent = formatMiles(Number(levels[idx]) || 0);
   };
   radiusRow.input.addEventListener('input', () => {
     const idx = parseInt(radiusRow.input.value, 10) | 0;
@@ -1038,7 +1049,7 @@ function render({ model, el }) {
   // Opacity slider: full range 0 → 1 so the user can make NBHDs entirely
   // transparent or fully opaque. Default 0.4 lands on the subtle look that
   // works well as a starting point.
-  const opacityRow = makeSliderRow('Opacity', { labelWidth: NBHD_LABEL_W, showValue: false });
+  const opacityRow = makeSliderRow('Opacity');
   opacityRow.input.min = '0'; opacityRow.input.max = '1'; opacityRow.input.step = '0.05';
   opacityRow.input.value = String(store.nbhd_opacity_mult.get());
   opacityRow.input.addEventListener('input', () => {
@@ -1049,6 +1060,36 @@ function render({ model, el }) {
   store.show_neighborhoods.subscribe((on) => {
     opacityRow.row.style.opacity = on ? '1' : '0.4';
     opacityRow.input.disabled = !on;
+  }, { immediate: true });
+
+  // ---- Rides count slider (1..10000, default 5000) ----
+  // Stacked under Spatial↔UMAP / Size in the Station column — the
+  // simulated rides live on the station network, so this groups
+  // naturally with the other station-related knobs. Drives the ambient
+  // pool size and mirrors to the `n_rides` Python traitlet. Narrow
+  // selections (single station / matrix cell) shrink the live pool to
+  // ~10% of this value; broad selections (dendrogram / category) keep
+  // the full count.
+  const ridesCountRow = makeSliderRow('Rides');
+  ridesCountRow.input.min = String(N_RIDES_MIN);
+  ridesCountRow.input.max = String(N_RIDES_MAX);
+  ridesCountRow.input.step = '200';
+  const refreshRidesCountSlider = () => {
+    const v = Math.max(N_RIDES_MIN, Math.min(N_RIDES_MAX, Number(store.n_rides.get()) | 0));
+    ridesCountRow.input.value = String(v);
+  };
+  ridesCountRow.input.addEventListener('input', () => {
+    const v = Math.max(N_RIDES_MIN, Math.min(N_RIDES_MAX, parseInt(ridesCountRow.input.value, 10) | 0));
+    store.n_rides.set(v);
+    model.set('n_rides', v);
+    model.save_changes();
+    scheduleRender();
+  });
+  colStation.appendChild(ridesCountRow.row);
+  store.n_rides.subscribe(refreshRidesCountSlider, { immediate: true });
+  store.show_rides.subscribe((on) => {
+    ridesCountRow.row.style.opacity = on ? '1' : '0.4';
+    ridesCountRow.input.disabled = !on;
   }, { immediate: true });
 
   // Map background fades from the basemap-matched grey toward pure white as we
@@ -1453,6 +1494,13 @@ function render({ model, el }) {
     refillRides(ridesPool, ridesSampler, focus || null, posLookup, palRgb, stationCluster, focusCtx);
     ridesFrame += 1;
     const ridesAlpha = Math.round(220 * Math.max(0, 1 - spatialMix));
+    // Dendrogram & manual-category selections paint rides in the
+    // selected group's cluster colors, which can be very light (yellow,
+    // mint, etc.) and hard to pick out against the basemap. Add a thin
+    // dark-grey stroke in those modes so each dot reads clearly.
+    const RIDES_STROKE_MODES = new Set(['col_dendro', 'row_dendro']);
+    const stroked = Boolean(focusCtx && RIDES_STROKE_MODES.has(focusCtx.mode));
+    const strokeAlpha = Math.round(180 * Math.max(0, 1 - spatialMix));
     return new ScatterplotLayer({
       id: 'bike-rides',
       data: ridesPool,
@@ -1467,13 +1515,19 @@ function render({ model, el }) {
         const c = d.color;
         return [c[0], c[1], c[2], ridesAlpha];
       },
-      stroked: false,
+      stroked,
+      lineWidthUnits: 'pixels',
+      lineWidthMinPixels: stroked ? 0.6 : 0,
+      getLineWidth: stroked ? 0.8 : 0,
+      getLineColor: [55, 60, 70, strokeAlpha],
       // Position changes every frame; bump trigger every frame so deck.gl
       // re-runs the accessor. Other accessors only invalidate on hops,
       // focus/sampler swaps, or palette changes.
       updateTriggers: {
         getPosition: ridesFrame,
         getFillColor: [ridesFrame, palRgb, ridesAlpha],
+        getLineColor: [stroked, strokeAlpha],
+        getLineWidth: stroked,
       },
     });
   };
@@ -1941,9 +1995,15 @@ function render({ model, el }) {
         })
         : null;
       const isFocused = Boolean(focusCtx);
-      // Pool resize: ambient ~2× stations clamped to [400, 5000];
-      // focused ~10% of that floored at 50 to stay visible.
-      resizeRidesPool(targetRidesPoolSize(stations.length, isFocused));
+      // Pool resize: ambient = slider value. Narrow selections (single
+      // station / matrix cell) shrink to ~10%. Dendro / category
+      // selections scale by selection_size / total_stations so the
+      // per-station ride density stays constant regardless of cluster
+      // size — pick a small cluster, get a small swarm.
+      const nRidesSlider = Number(store.n_rides.get());
+      resizeRidesPool(
+        targetRidesPoolSize(nRidesSlider, selectionKind, focusCtx, stations.length),
+      );
       ensureSampler(transitionTopk, stationOutflow);
       // Flush the pool whenever the selection kind/identity changes so
       // the swarm switches cleanly between modes (no stale rides from
@@ -2107,6 +2167,7 @@ function render({ model, el }) {
     store.transition_topk,
     store.station_outflow,
     store.show_rides,
+    store.n_rides,
     store.selection_kind,
   ].forEach((obs) => obs.subscribe(() => scheduleRender(), { immediate: false }));
 
@@ -2173,6 +2234,12 @@ function render({ model, el }) {
     store.show_neighborhoods.set(Boolean(model.get('show_neighborhoods') ?? true));
     store.show_stations.set(Boolean(model.get('show_stations') ?? true));
     store.show_rides.set(Boolean(model.get('show_rides') ?? true));
+    const nr = Number(model.get('n_rides'));
+    store.n_rides.set(
+      Number.isFinite(nr)
+        ? Math.max(N_RIDES_MIN, Math.min(N_RIDES_MAX, nr | 0))
+        : N_RIDES_DEFAULT,
+    );
     const tk = model.get('transition_topk') || {};
     store.transition_topk.set(tk && typeof tk === 'object' ? tk : {});
     const so = model.get('station_outflow') || {};
@@ -2207,6 +2274,7 @@ function render({ model, el }) {
     'show_neighborhoods',
     'show_stations',
     'show_rides',
+    'n_rides',
     'transition_topk',
     'station_outflow',
   ].forEach((name) => model.on(`change:${name}`, syncFromModel));
