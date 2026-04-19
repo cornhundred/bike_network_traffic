@@ -45259,7 +45259,12 @@ var createStore = () => ({
   show_stations: Observable(true),
   // Persistent "pinned" cluster — survives slider changes, cluster-resolution
   // tweaks, mouse leaves. Toggled by clicking an NBHD polygon.
-  pinned_cluster: Observable(null)
+  pinned_cluster: Observable(null),
+  // Front-end-only display multipliers driven by topbar sliders. Cosmetic, not
+  // synced to Python traitlets — they tweak the visual treatment without
+  // changing the semantic state of the map.
+  station_size_mult: Observable(1),
+  nbhd_opacity_mult: Observable(0.4)
 });
 var log3 = (store, ...args) => {
   if (store.debug.get()) console.log("[bike-map]", ...args);
@@ -45474,10 +45479,27 @@ function render({ model, el }) {
   const root = document.createElement("div");
   root.style.cssText = "background:#e2e4e8;border-radius:4px;overflow:hidden;display:flex;flex-direction:column;";
   el.appendChild(root);
-  const TOPBAR_HEIGHT = 38;
+  const TOPBAR_ROW_HEIGHT = 30;
+  const TOPBAR_HEIGHT = TOPBAR_ROW_HEIGHT * 2 + 12;
   const topbar = document.createElement("div");
-  topbar.style.cssText = "flex:0 0 auto;height:" + TOPBAR_HEIGHT + "px;box-sizing:border-box;display:flex;align-items:center;gap:14px;padding:0 12px;background:#f5f6f8;border-bottom:1px solid #d0d3d8;font:12px system-ui,sans-serif;color:#333;user-select:none;";
+  topbar.style.cssText = "flex:0 0 auto;height:" + TOPBAR_HEIGHT + "px;box-sizing:border-box;display:flex;flex-direction:row;align-items:stretch;gap:14px;padding:6px 12px;background:#f5f6f8;border-bottom:1px solid #d0d3d8;font:12px system-ui,sans-serif;color:#333;user-select:none;";
   root.appendChild(topbar);
+  const makeColumn = (flex) => {
+    const col = document.createElement("div");
+    col.style.cssText = "display:flex;flex-direction:column;justify-content:space-between;gap:4px;flex:" + flex + ";min-width:0;";
+    topbar.appendChild(col);
+    return col;
+  };
+  const divider = () => {
+    const d2 = document.createElement("div");
+    d2.style.cssText = "width:1px;align-self:stretch;background:#d0d3d8;flex:0 0 auto;";
+    return d2;
+  };
+  const colToggles = makeColumn("0 0 auto");
+  topbar.appendChild(divider());
+  const colStation = makeColumn("1 1 0");
+  topbar.appendChild(divider());
+  const colNbhd = makeColumn("1 1 0");
   const mapHolder = document.createElement("div");
   mapHolder.style.cssText = "flex:1 1 auto;position:relative;background:#e2e4e8;transition:background-color 200ms;";
   root.appendChild(mapHolder);
@@ -45486,11 +45508,12 @@ function render({ model, el }) {
     btn.style.color = on ? "#fff" : "#444";
     btn.style.borderColor = on ? "#1f77b4" : "#ccc";
   };
+  const TOGGLE_WIDTH = 72;
   const makeToggle = (label, observable, modelKey) => {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.textContent = label;
-    btn.style.cssText = "padding:3px 10px;border:1px solid #ccc;border-radius:4px;background:#fff;color:#444;font:inherit;cursor:pointer;transition:all 0.18s;";
+    btn.style.cssText = "width:" + TOGGLE_WIDTH + "px;height:" + TOPBAR_ROW_HEIGHT + "px;padding:0 8px;border:1px solid #ccc;border-radius:4px;background:#fff;color:#444;font:inherit;cursor:pointer;transition:all 0.18s;box-sizing:border-box;";
     styleToggleButton(btn, observable.get());
     btn.addEventListener("click", () => {
       const next = !observable.get();
@@ -45505,91 +45528,108 @@ function render({ model, el }) {
     observable.subscribe((v2) => styleToggleButton(btn, v2), { immediate: false });
     return btn;
   };
-  const toggleGroup = document.createElement("div");
-  toggleGroup.style.cssText = "display:flex;gap:6px;flex:0 0 auto;";
-  toggleGroup.appendChild(makeToggle("NBHD", store.show_neighborhoods, "show_neighborhoods"));
-  toggleGroup.appendChild(makeToggle("Stations", store.show_stations, "show_stations"));
-  topbar.appendChild(toggleGroup);
-  const divider = () => {
-    const d2 = document.createElement("div");
-    d2.style.cssText = "width:1px;align-self:stretch;background:#d0d3d8;margin:6px 0;";
-    return d2;
+  colToggles.appendChild(makeToggle("NBHD", store.show_neighborhoods, "show_neighborhoods"));
+  colToggles.appendChild(makeToggle("Stations", store.show_stations, "show_stations"));
+  const STATION_LABEL_W = 78;
+  const NBHD_LABEL_W = 50;
+  const VALUE_W = 48;
+  const makeSliderRow = (label, { labelWidth = STATION_LABEL_W, showValue = true }) => {
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex;align-items:center;gap:8px;height:" + TOPBAR_ROW_HEIGHT + "px;min-width:0;";
+    const labEl = document.createElement("span");
+    labEl.style.cssText = "color:#444;font-weight:500;white-space:nowrap;flex:0 0 " + labelWidth + "px;";
+    labEl.textContent = label;
+    const inp = document.createElement("input");
+    inp.type = "range";
+    inp.style.cssText = "flex:1 1 auto;min-width:50px;max-width:160px;cursor:pointer;";
+    row.appendChild(labEl);
+    row.appendChild(inp);
+    let valEl = null;
+    if (showValue) {
+      valEl = document.createElement("span");
+      valEl.style.cssText = "color:#666;font-variant-numeric:tabular-nums;flex:0 0 " + VALUE_W + "px;text-align:right;white-space:nowrap;";
+      row.appendChild(valEl);
+    }
+    return { row, input: inp, valEl };
   };
-  topbar.appendChild(divider());
-  const spatialBlock = document.createElement("div");
-  spatialBlock.style.cssText = "display:flex;align-items:center;gap:8px;flex:1 1 auto;min-width:0;";
-  const spatialLabel = document.createElement("span");
-  spatialLabel.style.cssText = "color:#444;font-weight:500;white-space:nowrap;";
-  spatialLabel.textContent = "Spatial \u2194 UMAP";
-  const slider = document.createElement("input");
-  slider.type = "range";
-  slider.min = "0";
-  slider.max = "1";
-  slider.step = "0.01";
-  slider.value = "0";
-  slider.style.cssText = "flex:1 1 auto;min-width:60px;cursor:pointer;";
-  slider.addEventListener("input", () => {
-    const t2 = parseFloat(slider.value);
+  const spatial = makeSliderRow("Spatial \u2194 UMAP", { labelWidth: STATION_LABEL_W });
+  spatial.input.min = "0";
+  spatial.input.max = "1";
+  spatial.input.step = "0.01";
+  spatial.input.value = "0";
+  const slider = spatial.input;
+  spatial.input.addEventListener("input", () => {
+    const t2 = parseFloat(spatial.input.value);
     store.spatial_mix.set(t2);
     model.set("spatial_mix", t2);
     model.save_changes();
   });
-  spatialBlock.appendChild(spatialLabel);
-  spatialBlock.appendChild(slider);
-  topbar.appendChild(spatialBlock);
-  let umapDividerEl = null;
+  colStation.appendChild(spatial.row);
   store.stations.subscribe((stations) => {
     const hasUmap = stations.some((s2) => s2.umap_lng != null && s2.umap_lat != null);
-    spatialBlock.style.display = hasUmap ? "flex" : "none";
-    if (umapDividerEl) umapDividerEl.style.display = hasUmap ? "block" : "none";
+    spatial.row.style.visibility = hasUmap ? "visible" : "hidden";
   }, { immediate: true });
-  umapDividerEl = divider();
-  topbar.appendChild(umapDividerEl);
-  const nbhdBlock = document.createElement("div");
-  nbhdBlock.style.cssText = "display:flex;align-items:center;gap:8px;flex:1 1 auto;min-width:0;";
-  const nbhdLabel = document.createElement("span");
-  nbhdLabel.style.cssText = "color:#444;font-weight:500;white-space:nowrap;";
-  nbhdLabel.textContent = "NBHD radius";
-  const nbhdSlider = document.createElement("input");
-  nbhdSlider.type = "range";
-  nbhdSlider.min = "0";
-  nbhdSlider.max = "0";
-  nbhdSlider.step = "1";
-  nbhdSlider.value = "0";
-  nbhdSlider.style.cssText = "flex:1 1 auto;min-width:60px;cursor:pointer;";
-  const nbhdValue = document.createElement("span");
-  nbhdValue.style.cssText = "color:#666;font-variant-numeric:tabular-nums;min-width:54px;text-align:right;white-space:nowrap;";
+  const sizeRow = makeSliderRow("Size", { labelWidth: STATION_LABEL_W, showValue: false });
+  sizeRow.input.min = "0.4";
+  sizeRow.input.max = "2.5";
+  sizeRow.input.step = "0.05";
+  sizeRow.input.value = String(store.station_size_mult.get());
+  sizeRow.input.addEventListener("input", () => {
+    store.station_size_mult.set(parseFloat(sizeRow.input.value));
+    scheduleRender();
+  });
+  colStation.appendChild(sizeRow.row);
+  store.show_stations.subscribe((on) => {
+    sizeRow.row.style.opacity = on ? "1" : "0.4";
+    sizeRow.input.disabled = !on;
+  }, { immediate: true });
+  const radiusRow = makeSliderRow("Radius", { labelWidth: NBHD_LABEL_W });
+  radiusRow.input.min = "0";
+  radiusRow.input.max = "0";
+  radiusRow.input.step = "1";
+  radiusRow.input.value = "0";
   const formatMiles = (mi) => mi < 0.1 ? `${(mi * 5280).toFixed(0)} ft` : `${mi.toFixed(2)} mi`;
   const refreshNbhdSlider = () => {
     const cp = store.cluster_polygons.get() || {};
     const levels = Array.isArray(cp.levels_miles) ? cp.levels_miles : [];
     if (!levels.length) {
-      nbhdBlock.style.display = "none";
+      radiusRow.row.style.visibility = "hidden";
       return;
     }
-    nbhdBlock.style.display = "flex";
-    nbhdSlider.max = String(levels.length - 1);
+    radiusRow.row.style.visibility = "visible";
+    radiusRow.input.max = String(levels.length - 1);
     const idx = Math.max(0, Math.min(levels.length - 1, store.alpha_index.get() | 0));
-    nbhdSlider.value = String(idx);
-    nbhdValue.textContent = formatMiles(Number(levels[idx]) || 0);
+    radiusRow.input.value = String(idx);
+    radiusRow.valEl.textContent = formatMiles(Number(levels[idx]) || 0);
   };
-  nbhdSlider.addEventListener("input", () => {
-    const idx = parseInt(nbhdSlider.value, 10) | 0;
+  radiusRow.input.addEventListener("input", () => {
+    const idx = parseInt(radiusRow.input.value, 10) | 0;
     store.alpha_index.set(idx);
     refreshNbhdSlider();
     model.set("alpha_index", idx);
     model.save_changes();
     scheduleRender();
   });
-  nbhdBlock.appendChild(nbhdLabel);
-  nbhdBlock.appendChild(nbhdSlider);
-  nbhdBlock.appendChild(nbhdValue);
-  topbar.appendChild(nbhdBlock);
+  colNbhd.appendChild(radiusRow.row);
   store.cluster_polygons.subscribe(refreshNbhdSlider, { immediate: true });
   store.alpha_index.subscribe(refreshNbhdSlider, { immediate: false });
   store.show_neighborhoods.subscribe((on) => {
-    nbhdBlock.style.opacity = on ? "1" : "0.4";
-    nbhdSlider.disabled = !on;
+    radiusRow.row.style.opacity = on ? "1" : "0.4";
+    radiusRow.input.disabled = !on;
+  }, { immediate: true });
+  const opacityRow = makeSliderRow("Opacity", { labelWidth: NBHD_LABEL_W, showValue: false });
+  opacityRow.input.min = "0";
+  opacityRow.input.max = "1";
+  opacityRow.input.step = "0.05";
+  opacityRow.input.value = String(store.nbhd_opacity_mult.get());
+  opacityRow.input.addEventListener("input", () => {
+    store.nbhd_opacity_mult.set(parseFloat(opacityRow.input.value));
+    scheduleRender();
+  });
+  colNbhd.appendChild(opacityRow.row);
+  store.show_neighborhoods.subscribe((on) => {
+    opacityRow.row.style.opacity = on ? "1" : "0.4";
+    opacityRow.input.disabled = !on;
   }, { immediate: true });
   store.spatial_mix.subscribe((mix) => {
     const t2 = Math.max(0, Math.min(1, Number(mix) || 0));
@@ -45993,13 +46033,14 @@ function render({ model, el }) {
     }
     const derivedKey = [...derivedClusters].sort((a2, b2) => a2 - b2).join(",");
     const isDerived = (cid) => derivedClusters.has(cid);
-    const nbhdFade = Math.max(0, 1 - spatialMix);
-    const NBHD_FILL_IDLE = 70;
-    const NBHD_FILL_HOVER = 90;
-    const NBHD_FILL_DIM = 18;
-    const NBHD_LINE_IDLE_ALPHA = 130;
-    const NBHD_LINE_HOVER_ALPHA = 245;
-    const NBHD_LINE_DIM_ALPHA = 50;
+    const nbhdOpacityMult = Math.max(0, Math.min(1, Number(store.nbhd_opacity_mult.get()) || 0));
+    const nbhdFade = Math.max(0, 1 - spatialMix) * nbhdOpacityMult;
+    const NBHD_FILL_IDLE = 255;
+    const NBHD_FILL_HOVER = 255;
+    const NBHD_FILL_DIM = 60;
+    const NBHD_LINE_IDLE_ALPHA = 200;
+    const NBHD_LINE_HOVER_ALPHA = 255;
+    const NBHD_LINE_DIM_ALPHA = 80;
     const NBHD_LINE_IDLE_W = 0.8;
     const NBHD_LINE_HOVER_W = 3.2;
     const NBHD_LINE_DIM_W = 0.4;
@@ -46007,7 +46048,10 @@ function render({ model, el }) {
       id: `bike-cluster-nbhd-${alphaIdx}`,
       data: polyData,
       visible: showNbhd && polyData.length > 0 && nbhdFade > 1e-3,
-      pickable: nbhdFade > 0.5,
+      // Pick while the layer is meaningfully present: not faded into UMAP
+      // and not dialed to (near-)transparent. The opacity threshold is
+      // intentionally low so hover still works at the default 0.4.
+      pickable: 1 - spatialMix > 0.5 && nbhdOpacityMult > 0.05,
       stroked: true,
       filled: true,
       lineWidthUnits: "pixels",
@@ -46035,9 +46079,9 @@ function render({ model, el }) {
         // alphaIdx is not here — the layer id already changes with it, so
         // deck.gl will instantiate a fresh layer rather than retriggering
         // attribute updates against stale geometry.
-        getFillColor: [derivedKey, palRgb, spatialMix, renderVersion],
-        getLineColor: [derivedKey, palRgb, spatialMix, renderVersion],
-        getLineWidth: [derivedKey, spatialMix, renderVersion],
+        getFillColor: [derivedKey, palRgb, spatialMix, nbhdOpacityMult, renderVersion],
+        getLineColor: [derivedKey, palRgb, spatialMix, nbhdOpacityMult, renderVersion],
+        getLineWidth: [derivedKey, spatialMix, nbhdOpacityMult, renderVersion],
         getPolygon: [spatialMix, renderVersion]
       },
       onHover: (info) => {
@@ -46067,6 +46111,15 @@ function render({ model, el }) {
     });
     const pointData = stations.map((d2) => d2);
     const showStations = store.show_stations.get();
+    const stationSizeMult = Math.max(0.05, Number(store.station_size_mult.get()) || 1);
+    const STATION_STROKE = [44, 50, 60];
+    const isStationEmphasized = (d2) => {
+      const n3 = d2.name;
+      if (focus) return n3 === focus || out.has(n3) || inn.has(n3);
+      if (highlights.size > 0) return highlights.has(n3);
+      if (stationFocusCluster != null) return d2.cluster_id === stationFocusCluster;
+      return false;
+    };
     const points = new scatterplot_layer_default({
       id: "bike-stations",
       data: pointData,
@@ -46075,16 +46128,23 @@ function render({ model, el }) {
       radiusUnits: "meters",
       // Low-ish min-pixel floor so dots still shrink at low zooms;
       // selected/focus stations stay readable via their larger meter radii.
-      radiusMinPixels: 1.5,
-      radiusMaxPixels: 48,
+      radiusMinPixels: 1.5 * stationSizeMult,
+      radiusMaxPixels: 48 * stationSizeMult,
+      stroked: true,
+      lineWidthUnits: "pixels",
+      lineWidthMinPixels: 0,
       getPosition: (d2) => posLookup[d2.name] || [Number(d2.lng), Number(d2.lat)],
       getRadius: (d2) => {
         const n3 = d2.name;
-        if (focus && n3 === focus) return focusHubRadius();
-        if (focus && (out.has(n3) || inn.has(n3))) return linkedRadius(n3);
-        if (highlights.has(n3)) return 66;
-        return hasSel ? 50 : 66;
+        let r2;
+        if (focus && n3 === focus) r2 = focusHubRadius();
+        else if (focus && (out.has(n3) || inn.has(n3))) r2 = linkedRadius(n3);
+        else if (highlights.has(n3)) r2 = 66;
+        else r2 = hasSel ? 50 : 66;
+        return r2 * stationSizeMult;
       },
+      getLineColor: (d2) => isStationEmphasized(d2) ? [...STATION_STROKE, 220] : [0, 0, 0, 0],
+      getLineWidth: (d2) => isStationEmphasized(d2) ? 1.5 : 0,
       getFillColor: (d2) => {
         const n3 = d2.name;
         if (focus) {
@@ -46113,11 +46173,15 @@ function render({ model, el }) {
       },
       transitions: {
         getFillColor: 400,
-        getRadius: 400
+        getRadius: 400,
+        getLineColor: 250,
+        getLineWidth: 250
       },
       updateTriggers: {
-        getRadius: [styleKey, renderVersion],
+        getRadius: [styleKey, stationSizeMult, renderVersion],
         getFillColor: [styleKey, renderVersion],
+        getLineColor: [styleKey, renderVersion],
+        getLineWidth: [styleKey, renderVersion],
         getPosition: [spatialMix, renderVersion]
       },
       onHover: (info) => {
@@ -46294,7 +46358,9 @@ function render({ model, el }) {
     store.alpha_index,
     store.show_neighborhoods,
     store.show_stations,
-    store.pinned_cluster
+    store.pinned_cluster,
+    store.station_size_mult,
+    store.nbhd_opacity_mult
   ].forEach((obs) => obs.subscribe(() => scheduleRender(), { immediate: false }));
   const syncFromModel = () => {
     const ci = JSON.stringify(model.get("click_info") || {});
