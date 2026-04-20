@@ -45487,15 +45487,31 @@ function flowBlendWithAlpha(outW, inW, alpha) {
   return [r2, g2, b2, alpha];
 }
 var N_RIDES_MIN = 1;
-var N_RIDES_MAX = 2e4;
+var N_RIDES_MIN_CAP = 1e3;
+var N_RIDES_MAX_CAP = 2e4;
 var N_RIDES_DEFAULT = 1e4;
+var RIDES_PER_STATION_CAP = 10;
+function cityRidesRange(numStations) {
+  const n2 = Math.max(0, Math.round(Number(numStations) || 0));
+  const max4 = Math.max(
+    N_RIDES_MIN_CAP,
+    Math.min(N_RIDES_MAX_CAP, n2 * RIDES_PER_STATION_CAP || N_RIDES_MIN_CAP)
+  );
+  const defaultValue = Math.max(
+    N_RIDES_MIN,
+    Math.round((N_RIDES_MIN + max4) / 2)
+  );
+  const rawStep = Math.max(50, Math.round(max4 / 100));
+  const step = Math.max(50, Math.round(rawStep / 50) * 50);
+  return { min: N_RIDES_MIN, max: max4, defaultValue, step };
+}
 var RIDES_FOCUSED_FRACTION = 0.1;
 var RIDES_FOCUSED_MIN = 50;
 var NARROW_FOCUS_KINDS = /* @__PURE__ */ new Set(["station", "mat_cell"]);
 function targetRidesPoolSize(nRides, kind, focusCtx, totalStations) {
   const n2 = Math.max(
     N_RIDES_MIN,
-    Math.min(N_RIDES_MAX, Math.round(Number(nRides) || N_RIDES_DEFAULT))
+    Math.min(N_RIDES_MAX_CAP, Math.round(Number(nRides) || N_RIDES_DEFAULT))
   );
   if (NARROW_FOCUS_KINDS.has(kind)) {
     return Math.max(RIDES_FOCUSED_MIN, Math.round(n2 * RIDES_FOCUSED_FRACTION));
@@ -46031,21 +46047,50 @@ function render({ model, el }) {
     opacityRow.input.disabled = !on;
   }, { immediate: true });
   const ridesCountRow = makeSliderRow("Rides");
-  ridesCountRow.input.min = String(N_RIDES_MIN);
-  ridesCountRow.input.max = String(N_RIDES_MAX);
-  ridesCountRow.input.step = "200";
+  let ridesRange = cityRidesRange(0);
+  let lastRidesSliderMax = 0;
+  const applyRidesRange = (range) => {
+    const prevMax = lastRidesSliderMax;
+    lastRidesSliderMax = range.max;
+    ridesRange = range;
+    ridesCountRow.input.min = String(range.min);
+    ridesCountRow.input.max = String(range.max);
+    ridesCountRow.input.step = String(range.step);
+    let cur = Number(store.n_rides.get()) | 0;
+    if (prevMax === N_RIDES_MIN_CAP && range.max > N_RIDES_MIN_CAP && cur <= N_RIDES_MIN_CAP) {
+      cur = range.defaultValue;
+    }
+    const clamped = Math.max(range.min, Math.min(range.max, cur || range.defaultValue));
+    if (clamped !== (Number(store.n_rides.get()) | 0)) {
+      store.n_rides.set(clamped);
+      model.set("n_rides", clamped);
+      model.save_changes();
+    }
+    ridesCountRow.input.value = String(clamped);
+  };
+  applyRidesRange(ridesRange);
   const refreshRidesCountSlider = () => {
-    const v2 = Math.max(N_RIDES_MIN, Math.min(N_RIDES_MAX, Number(store.n_rides.get()) | 0));
+    const v2 = Math.max(ridesRange.min, Math.min(ridesRange.max, Number(store.n_rides.get()) | 0));
     ridesCountRow.input.value = String(v2);
   };
   ridesCountRow.input.addEventListener("input", () => {
-    const v2 = Math.max(N_RIDES_MIN, Math.min(N_RIDES_MAX, parseInt(ridesCountRow.input.value, 10) | 0));
+    const v2 = Math.max(
+      ridesRange.min,
+      Math.min(ridesRange.max, parseInt(ridesCountRow.input.value, 10) | 0)
+    );
     store.n_rides.set(v2);
     model.set("n_rides", v2);
     model.save_changes();
     scheduleRender();
   });
   colStation.appendChild(ridesCountRow.row);
+  let lastStationCountForRides = -1;
+  store.stations.subscribe((stations) => {
+    const n2 = (stations || []).length;
+    if (n2 === lastStationCountForRides) return;
+    lastStationCountForRides = n2;
+    applyRidesRange(cityRidesRange(n2));
+  }, { immediate: true });
   store.n_rides.subscribe(refreshRidesCountSlider, { immediate: true });
   store.show_rides.subscribe((on) => {
     ridesCountRow.row.style.opacity = on ? "1" : "0.4";
@@ -46989,7 +47034,7 @@ function render({ model, el }) {
     store.show_rides.set(Boolean(model.get("show_rides") ?? true));
     const nr = Number(model.get("n_rides"));
     store.n_rides.set(
-      Number.isFinite(nr) ? Math.max(N_RIDES_MIN, Math.min(N_RIDES_MAX, nr | 0)) : N_RIDES_DEFAULT
+      Number.isFinite(nr) ? Math.max(N_RIDES_MIN, Math.min(N_RIDES_MAX_CAP, nr | 0)) : N_RIDES_DEFAULT
     );
     const tk = model.get("transition_topk") || {};
     store.transition_topk.set(tk && typeof tk === "object" ? tk : {});

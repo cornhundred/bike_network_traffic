@@ -292,8 +292,8 @@ function flowBlendWithAlpha(outW, inW, alpha) {
 // driven; Python only ships the sparse top-K table once at widget
 // creation so this works in fully static HTML embeds.
 
-// Ride pool sizing. The user-facing "Rides" slider (1..N_RIDES_MAX,
-// default N_RIDES_DEFAULT) sets the ambient pool size directly via the
+// Ride pool sizing. The user-facing "Rides" slider (1..city max,
+// default ~half of city max) sets the ambient pool size directly via the
 // `n_rides` traitlet. Three selection regimes:
 //
 //   - narrow ('station' / 'mat_cell'): shrink to RIDES_FOCUSED_FRACTION
@@ -306,16 +306,40 @@ function flowBlendWithAlpha(outW, inW, alpha) {
 //     proportionally small swarm (so per-station ride density stays
 //     constant whether you click a big or small group).
 //   - ambient (no focus): full slider value.
+// Hard floor / ceiling for the per-city slider range. Per-city max is
+// ~RIDES_PER_STATION_CAP × stations clamped into [N_RIDES_MIN_CAP,
+// N_RIDES_MAX_CAP]; default starts at half the per-city max. Values:
+// NYC ~2000 stations -> max 20000, default midpoint ~10000; Chicago ~900 ->
+// max 9000, default ~4500; Boston ~400 -> max 4000, default ~2000.
 const N_RIDES_MIN = 1;
-const N_RIDES_MAX = 20000;
+const N_RIDES_MIN_CAP = 1000;
+const N_RIDES_MAX_CAP = 20000;
+// Fallback when `n_rides` is missing / NaN (~midpoint of NYC-scale max).
 const N_RIDES_DEFAULT = 10000;
+const RIDES_PER_STATION_CAP = 10;
+function cityRidesRange(numStations) {
+  const n = Math.max(0, Math.round(Number(numStations) || 0));
+  const max = Math.max(
+    N_RIDES_MIN_CAP,
+    Math.min(N_RIDES_MAX_CAP, n * RIDES_PER_STATION_CAP || N_RIDES_MIN_CAP),
+  );
+  // Initial thumb at the linear center of [min, max] on the slider track.
+  const defaultValue = Math.max(
+    N_RIDES_MIN,
+    Math.round((N_RIDES_MIN + max) / 2),
+  );
+  // Step ~1% of range, rounded to a nice multiple of 50, min 50.
+  const rawStep = Math.max(50, Math.round(max / 100));
+  const step = Math.max(50, Math.round(rawStep / 50) * 50);
+  return { min: N_RIDES_MIN, max, defaultValue, step };
+}
 const RIDES_FOCUSED_FRACTION = 0.10;
 const RIDES_FOCUSED_MIN = 50;
 const NARROW_FOCUS_KINDS = new Set(['station', 'mat_cell']);
 function targetRidesPoolSize(nRides, kind, focusCtx, totalStations) {
   const n = Math.max(
     N_RIDES_MIN,
-    Math.min(N_RIDES_MAX, Math.round(Number(nRides) || N_RIDES_DEFAULT)),
+    Math.min(N_RIDES_MAX_CAP, Math.round(Number(nRides) || N_RIDES_DEFAULT)),
   );
   if (NARROW_FOCUS_KINDS.has(kind)) {
     return Math.max(RIDES_FOCUSED_MIN, Math.round(n * RIDES_FOCUSED_FRACTION));
@@ -1062,30 +1086,73 @@ function render({ model, el }) {
     opacityRow.input.disabled = !on;
   }, { immediate: true });
 
-  // ---- Rides count slider (1..10000, default 5000) ----
+  // ---- Rides count slider ----
   // Stacked under Spatial↔UMAP / Size in the Station column — the
   // simulated rides live on the station network, so this groups
-  // naturally with the other station-related knobs. Drives the ambient
-  // pool size and mirrors to the `n_rides` Python traitlet. Narrow
-  // selections (single station / matrix cell) shrink the live pool to
-  // ~10% of this value; broad selections (dendrogram / category) keep
-  // the full count.
+  // naturally with the other station-related knobs. The slider range
+  // is *city-scaled* (`cityRidesRange(numStations)`): NYC tops out at
+  // 20k, Boston at 4k, etc., so the slider feel is consistent across
+  // cities of very different sizes. Drives the ambient pool size and
+  // mirrors to the `n_rides` Python traitlet. Narrow selections (single
+  // station / matrix cell) shrink the live pool to ~10% of this value;
+  // dendro / category selections scale by selection_size /
+  // total_stations.
   const ridesCountRow = makeSliderRow('Rides');
-  ridesCountRow.input.min = String(N_RIDES_MIN);
-  ridesCountRow.input.max = String(N_RIDES_MAX);
-  ridesCountRow.input.step = '200';
+  let ridesRange = cityRidesRange(0);
+  // Tracks the previous slider max so we can detect the bootstrap hop from
+  // the placeholder range (numStations === 0 → max === N_RIDES_MIN_CAP) to
+  // the real city cap. Without this, `n_rides` gets clamped to 1000 once and
+  // never moves up when stations load — the thumb sits at ~5% forever.
+  let lastRidesSliderMax = 0;
+  const applyRidesRange = (range) => {
+    const prevMax = lastRidesSliderMax;
+    lastRidesSliderMax = range.max;
+    ridesRange = range;
+    ridesCountRow.input.min = String(range.min);
+    ridesCountRow.input.max = String(range.max);
+    ridesCountRow.input.step = String(range.step);
+    let cur = Number(store.n_rides.get()) | 0;
+    if (
+      prevMax === N_RIDES_MIN_CAP
+      && range.max > N_RIDES_MIN_CAP
+      && cur <= N_RIDES_MIN_CAP
+    ) {
+      cur = range.defaultValue;
+    }
+    const clamped = Math.max(range.min, Math.min(range.max, cur || range.defaultValue));
+    if (clamped !== (Number(store.n_rides.get()) | 0)) {
+      store.n_rides.set(clamped);
+      model.set('n_rides', clamped);
+      model.save_changes();
+    }
+    ridesCountRow.input.value = String(clamped);
+  };
+  applyRidesRange(ridesRange);
   const refreshRidesCountSlider = () => {
-    const v = Math.max(N_RIDES_MIN, Math.min(N_RIDES_MAX, Number(store.n_rides.get()) | 0));
+    const v = Math.max(ridesRange.min, Math.min(ridesRange.max, Number(store.n_rides.get()) | 0));
     ridesCountRow.input.value = String(v);
   };
   ridesCountRow.input.addEventListener('input', () => {
-    const v = Math.max(N_RIDES_MIN, Math.min(N_RIDES_MAX, parseInt(ridesCountRow.input.value, 10) | 0));
+    const v = Math.max(
+      ridesRange.min,
+      Math.min(ridesRange.max, parseInt(ridesCountRow.input.value, 10) | 0),
+    );
     store.n_rides.set(v);
     model.set('n_rides', v);
     model.save_changes();
     scheduleRender();
   });
   colStation.appendChild(ridesCountRow.row);
+  // Recompute the slider range whenever the station set changes (city
+  // switch, lazy load, etc). Skip when the count hasn't changed so we
+  // don't fight an in-progress drag.
+  let lastStationCountForRides = -1;
+  store.stations.subscribe((stations) => {
+    const n = (stations || []).length;
+    if (n === lastStationCountForRides) return;
+    lastStationCountForRides = n;
+    applyRidesRange(cityRidesRange(n));
+  }, { immediate: true });
   store.n_rides.subscribe(refreshRidesCountSlider, { immediate: true });
   store.show_rides.subscribe((on) => {
     ridesCountRow.row.style.opacity = on ? '1' : '0.4';
@@ -2237,7 +2304,7 @@ function render({ model, el }) {
     const nr = Number(model.get('n_rides'));
     store.n_rides.set(
       Number.isFinite(nr)
-        ? Math.max(N_RIDES_MIN, Math.min(N_RIDES_MAX, nr | 0))
+        ? Math.max(N_RIDES_MIN, Math.min(N_RIDES_MAX_CAP, nr | 0))
         : N_RIDES_DEFAULT,
     );
     const tk = model.get('transition_topk') || {};

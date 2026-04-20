@@ -616,13 +616,18 @@ station_outflow = traitlets.Dict({}).tag(sync=True)</pre>
     <code>targetRidesPoolSize(nRides, kind, focusCtx, totalStations)</code> with
     three regimes. <em>Narrow</em> selections (single station, matrix cell)
     return <code>max(50, round(nRides &times; 0.10))</code> &mdash; a one-station
-    view doesn&apos;t need 10k walkers and the dense swarm would obscure the
+    view doesn&apos;t need thousands of walkers and the dense swarm would obscure the
     in/out lines. <em>Dendrogram &amp; category</em> selections scale linearly
     by <code>selection_size / total_stations</code>, floored at 50: per-station
     ride density stays constant whether you click a 30-station cluster or a
     300-station one. <em>Ambient</em> (no focus) returns the full slider value.
-    With the slider at the default 10k and ~2000 NYC stations, a 200-station
-    cluster animates ~1000 walkers, a 30-station cluster ~150.
+    The per-city slider max is about <code>10 &times; num_stations</code> (clamped
+    1k–20k); the initial thumb is the linear midpoint of that range. When the
+    station list first arrives, if <code>n_rides</code> was only clamped to the
+    placeholder cap (1k before <code>num_stations</code> was known), it is reset
+    to that midpoint so the control doesn&apos;t stay pegged near the minimum.
+    With the default and ~2000 NYC stations (max 20k, default ~10k), a 200-station
+    cluster animates <code>&sim;1000</code> walkers, a 30-station cluster <code>&sim;150</code>.
   </p>
   <p>
     Dendro and category selections also opt in to a thin dark-grey stroke around
