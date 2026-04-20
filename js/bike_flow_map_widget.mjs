@@ -47,6 +47,9 @@ const createStore = () => ({
   //   'cat_value'     — manual category selection (treated like col_dendro
   //                      since the natural interpretation is "rides
   //                      starting from any of these stations")
+  //   'nbhd_cluster'  — NBHD polygon click: same station set + ride semantics
+  //                      as dendrogram (transition_topk outgoing + incoming
+  //                      mix), not edge_index flow lines or hub red/blue fill
   selection_kind: Observable(null),
   deck_check: Observable({ inputs: true, computed: true, layers: true }),
   deck_ready: Observable(false),
@@ -95,6 +98,18 @@ const log = (store, ...args) => {
 // flows — top-30 keeps the geometry readable instead of devolving into
 // spaghetti when a Manhattan hub has hundreds of non-trivial neighbors.
 const MAP_STATION_SLICE_TOP_K = 30;
+/** Station names belonging to `clusterId` (for NBHD polygon → dendro-style selection). */
+function highlightsForNbhdCluster(clusterId, store) {
+  const stations = store.stations.get() || [];
+  const h = [];
+  for (const s of stations) {
+    if (Number(s.cluster_id) === Number(clusterId)) {
+      const n = String(s.name || '').trim();
+      if (n) h.push(n);
+    }
+  }
+  return h;
+}
 
 /**
  * Ask the Clustergram for a normal row-axis + col-axis slice (same station on both axes).
@@ -344,10 +359,12 @@ function targetRidesPoolSize(nRides, kind, focusCtx, totalStations) {
   if (NARROW_FOCUS_KINDS.has(kind)) {
     return Math.max(RIDES_FOCUSED_MIN, Math.round(n * RIDES_FOCUSED_FRACTION));
   }
-  if (focusCtx && (focusCtx.mode === 'col_dendro' || focusCtx.mode === 'row_dendro')) {
+  if (focusCtx && (focusCtx.mode === 'col_dendro' || focusCtx.mode === 'row_dendro' || focusCtx.mode === 'nbhd_cluster')) {
     const selSize = focusCtx.mode === 'col_dendro'
       ? (focusCtx.origin?.names?.length || 0)
-      : (focusCtx.dest?.names?.length || 0);
+      : focusCtx.mode === 'row_dendro'
+        ? (focusCtx.dest?.names?.length || 0)
+        : (focusCtx.memberCount | 0);
     const total = Math.max(1, Number(totalStations) || 0);
     if (selSize > 0) {
       const frac = Math.min(1, selSize / total);
@@ -603,6 +620,9 @@ function buildWeightedCdf(weighted, posLookup) {
  *                  total inflow into the selection) and an origin
  *                  from that destination's incoming CDF
  *   - 'cat_value'  manual category — same as 'col_dendro'
+ *   - 'nbhd_cluster' polygon pin — col_dendro + row_dendro combined (mixed
+ *                  outgoing/incoming rides from transition_topk); no
+ *                  edge_index line layer; highlights-only station styling
  *
  * Returns null when no usable rides can be generated (no positions,
  * empty distributions, ...).
@@ -706,6 +726,67 @@ function buildFocusedRideContext({
     return { mode: 'row_dendro', dest, originByDest };
   }
 
+  if (kind === 'nbhd_cluster') {
+    // Match dendrogram ride semantics: outgoing trips sampled like col_dendro
+    // (origin in set → dest from transition_topk) and incoming like row_dendro
+    // (dest in set ← origin from inverted top-K). No edge_index arrows; station
+    // dots use highlight-only styling like a multi-select dendrogram branch.
+    const sel = (highlights || []).filter(has);
+    if (sel.length === 0) return null;
+    const memberCount = sel.length;
+    const useOutflow = stationOutflow && Object.keys(stationOutflow).length > 0;
+    const originPairs = sel.map((n) => [n, useOutflow ? (Number(stationOutflow[n]) || 1) : 1]);
+    const origin = buildWeightedCdf(originPairs, posLookup);
+    const destByOrigin = new Map();
+    for (const o of sel) {
+      const entries = (transitionTopk || {})[o];
+      if (!Array.isArray(entries) || entries.length === 0) continue;
+      const cdf = buildWeightedCdf(
+        entries
+          .filter((row) => row && row[0] !== o)
+          .map((row) => [String(row[0]), Number(row[1]) || 0]),
+        posLookup,
+      );
+      if (cdf) destByOrigin.set(o, cdf);
+    }
+    const selSet = new Set(sel);
+    const inflowByDest = new Map();
+    for (const d of sel) inflowByDest.set(d, []);
+    for (const [oorigin, entries] of Object.entries(transitionTopk || {})) {
+      if (!Array.isArray(entries) || entries.length === 0) continue;
+      if (!has(oorigin)) continue;
+      for (const row of entries) {
+        const dest = String(row?.[0] || '');
+        if (!selSet.has(dest) || dest === oorigin) continue;
+        const w = Number(row?.[1]) || 0;
+        if (w <= 0) continue;
+        inflowByDest.get(dest).push([oorigin, w]);
+      }
+    }
+    const originByDest = new Map();
+    const destPairs = [];
+    for (const d of sel) {
+      const cdf = buildWeightedCdf(inflowByDest.get(d) || [], posLookup);
+      if (!cdf) continue;
+      originByDest.set(d, cdf);
+      destPairs.push([d, cdf.total]);
+    }
+    const dest_cdf = buildWeightedCdf(destPairs, posLookup);
+    const colOk = Boolean(origin && destByOrigin.size > 0);
+    const rowOk = Boolean(dest_cdf && originByDest.size > 0);
+    if (!colOk && !rowOk) return null;
+    return {
+      mode: 'nbhd_cluster',
+      memberCount,
+      colOk,
+      rowOk,
+      origin: colOk ? origin : null,
+      destByOrigin: colOk ? destByOrigin : null,
+      dest: rowOk ? dest_cdf : null,
+      originByDest: rowOk ? originByDest : null,
+    };
+  }
+
   return null;
 }
 
@@ -749,6 +830,46 @@ function spawnFocusedRide(focusCtx, posLookup, paletteRgb, stationCluster) {
     if (!cdf) return null;
     from = pickFromCdfArr(cdf.names, cdf.cum, cdf.total);
     to = d;
+  } else if (focusCtx.mode === 'nbhd_cluster') {
+    const { colOk, rowOk, origin, destByOrigin, dest, originByDest } = focusCtx;
+    if (!colOk && !rowOk) return null;
+    if (colOk && !rowOk) {
+      const o = pickFromCdfArr(origin.names, origin.cum, origin.total);
+      if (!o) return null;
+      const cdf = destByOrigin.get(o);
+      if (!cdf) return null;
+      from = o;
+      to = pickFromCdfArr(cdf.names, cdf.cum, cdf.total);
+    } else if (!colOk && rowOk) {
+      const d = pickFromCdfArr(dest.names, dest.cum, dest.total);
+      if (!d) return null;
+      const cdf = originByDest.get(d);
+      if (!cdf) return null;
+      from = pickFromCdfArr(cdf.names, cdf.cum, cdf.total);
+      to = d;
+    } else {
+      let colMass = 0;
+      for (const cdf of destByOrigin.values()) colMass += cdf.total;
+      let rowMass = 0;
+      for (const cdf of originByDest.values()) rowMass += cdf.total;
+      const mass = colMass + rowMass;
+      if (mass <= 0) return null;
+      if (Math.random() * mass < colMass) {
+        const o = pickFromCdfArr(origin.names, origin.cum, origin.total);
+        if (!o) return null;
+        const cdf = destByOrigin.get(o);
+        if (!cdf) return null;
+        from = o;
+        to = pickFromCdfArr(cdf.names, cdf.cum, cdf.total);
+      } else {
+        const d = pickFromCdfArr(dest.names, dest.cum, dest.total);
+        if (!d) return null;
+        const cdf = originByDest.get(d);
+        if (!cdf) return null;
+        from = pickFromCdfArr(cdf.names, cdf.cum, cdf.total);
+        to = d;
+      }
+    }
   }
 
   if (!from || !to || !posLookup[from] || !posLookup[to]) return null;
@@ -985,7 +1106,7 @@ function render({ model, el }) {
   // visually read as a single switchboard. Label width is sized to the
   // longest label ("Spatial ↔ UMAP"); shorter labels left-align inside.
   const SLIDER_LABEL_W = 88;
-  const SLIDER_INPUT_W = 120;
+  const SLIDER_INPUT_W = 96;
 
   // makeSliderRow: a horizontal label + range row. No value readout —
   // the slider position itself is the affordance for these cosmetic
@@ -1197,13 +1318,16 @@ function render({ model, el }) {
     const focus = store.focus.get();
     const out = new Map();
     const inn = new Map();
-    if (!focus) return { out, inn };
-    for (const e of store.edges.get() || []) {
-      if (e.direction === 'out' && e.source_name === focus) {
-        out.set(e.target_name, Number(e.weight) || 0);
-      } else if (e.direction === 'in' && e.target_name === focus) {
-        inn.set(e.source_name, Number(e.weight) || 0);
+    const edges = store.edges.get() || [];
+    if (focus) {
+      for (const e of edges) {
+        if (e.direction === 'out' && e.source_name === focus) {
+          out.set(e.target_name, Number(e.weight) || 0);
+        } else if (e.direction === 'in' && e.target_name === focus) {
+          inn.set(e.source_name, Number(e.weight) || 0);
+        }
       }
+      return { out, inn };
     }
     return { out, inn };
   };
@@ -1218,6 +1342,12 @@ function render({ model, el }) {
 
     const setState = (focus, highlights, edges) =>
       setDerivedState(store, { focus, highlights, edges });
+
+    // Clustergram / matrix selections should drop a map-only NBHD pin; otherwise
+    // the polygon stays visually selected while flows/highlights follow the dendrogram.
+    const releasePinnedNbhd = () => {
+      if (store.pinned_cluster.get() != null) store.pinned_cluster.set(null);
+    };
 
     const stationFrom = (raw) => {
       const txt = String(raw || '').trim();
@@ -1239,6 +1369,7 @@ function render({ model, el }) {
     const acoord = (n) => (n && idx[n]?.coord) || (n ? coordMap[n] : undefined);
 
     if (t === 'row_label' || t === 'col_label') {
+      releasePinnedNbhd();
       const name = stationFrom(v.name);
       const actionKey = `${t}:${name}`;
       if (actionKey === lastActionKey && seq !== lastActionSeq) {
@@ -1327,6 +1458,7 @@ function render({ model, el }) {
     }
 
     if (t === 'mat_value') {
+      releasePinnedNbhd();
       const row = stationFrom((v.row || {}).name);
       const col = stationFrom((v.col || {}).name);
       const actionKey = `mat:${col}->${row}`;
@@ -1369,6 +1501,7 @@ function render({ model, el }) {
     }
 
     if (t === 'row_dendro' || t === 'col_dendro') {
+      releasePinnedNbhd();
       const hasStation = (n) => Boolean(n && (idx[n] || coordMap[n]));
       const fromClick = (v.selected_names || []).map(stationFrom).filter(hasStation);
       const rows = (store.selected_rows.get() || []).map(stationFrom).filter(hasStation);
@@ -1399,6 +1532,7 @@ function render({ model, el }) {
     }
 
     if (t === 'cat_value') {
+      releasePinnedNbhd();
       const axis = v.axis;
       const attrIndex = v.attr_index;
       const catVal = v.value;
@@ -1421,6 +1555,7 @@ function render({ model, el }) {
 
     const slPair = store.matrix_axis_slice.get() || {};
     if (slPair.slice_kind === 'row_col') {
+      releasePinnedNbhd();
       const primaryRaw =
         slPair.row_axis?.primary_name ?? slPair.col_axis?.primary_name ?? null;
       if (!primaryRaw) return;
@@ -1538,6 +1673,8 @@ function render({ model, el }) {
         sig += `|out:${focusCtx.origin.names.slice().sort().join(',')}`;
       } else if (focusCtx.mode === 'row_dendro') {
         sig += `|in:${focusCtx.dest.names.slice().sort().join(',')}`;
+      } else if (focusCtx.mode === 'nbhd_cluster') {
+        sig += `|nbhd:${focusCtx.memberCount}|c${focusCtx.colOk ? 1 : 0}r${focusCtx.rowOk ? 1 : 0}`;
       }
     } else if (focusName) {
       sig += `|${focusName}`;
@@ -1565,7 +1702,7 @@ function render({ model, el }) {
     // selected group's cluster colors, which can be very light (yellow,
     // mint, etc.) and hard to pick out against the basemap. Add a thin
     // dark-grey stroke in those modes so each dot reads clearly.
-    const RIDES_STROKE_MODES = new Set(['col_dendro', 'row_dendro']);
+    const RIDES_STROKE_MODES = new Set(['col_dendro', 'row_dendro', 'nbhd_cluster']);
     const stroked = Boolean(focusCtx && RIDES_STROKE_MODES.has(focusCtx.mode));
     const strokeAlpha = Math.round(180 * Math.max(0, 1 - spatialMix));
     return new ScatterplotLayer({
@@ -1610,6 +1747,7 @@ function render({ model, el }) {
     const highlightArr = store.highlights.get() || [];
     const highlights = new Set(highlightArr);
     const edges = store.edges.get() || [];
+    const selectionKind = store.selection_kind.get();
     const stationNameSet = new Set(stations.map((d) => d.name));
     const overlap = highlightArr.filter((n) => stationNameSet.has(n));
     log(store, 'buildLayers', {
@@ -1685,7 +1823,7 @@ function render({ model, el }) {
       .map(([k, v]) => `${k}:${v}`)
       .sort()
       .join('|');
-    const styleKey = `${focus}__${highlightKey}__${outKey}__${inKey}__${hasSel}__${spatialMix}__${hoveredCluster}__${pinnedCluster}`;
+    const styleKey = `${focus}__${highlightKey}__${outKey}__${inKey}__${hasSel}__${spatialMix}__${hoveredCluster}__${pinnedCluster}__${selectionKind || ''}`;
 
     let peakLinkWeight = 0;
     for (const v of out.values()) peakLinkWeight = Math.max(peakLinkWeight, v);
@@ -1843,27 +1981,55 @@ function render({ model, el }) {
       },
       onClick: (info) => {
         if (!info.object) return;
-        // NBHD click pins the cluster for a persistent, discussion-ready
-        // highlight. Clicking the same cluster again unpins. We also clear any
-        // prior clustergram-driven selection (focus/highlights/edges +
-        // click_info / matrix_axis_slice upstream) so the pinned NBHD view
-        // starts clean.
+        // NBHD click pins the polygon and selects all stations in that cluster
+        // with the same transition_topk ride behavior as dendrogram (mixed
+        // outgoing + incoming), not edge_index arrows or single-station red/blue
+        // hub styling. Click again to unpin.
         const cid = Number(info.object.cluster_id);
         const current = store.pinned_cluster.get();
         const next = current === cid ? null : cid;
-        store.pinned_cluster.set(next);
+        if (next == null) {
+          store.pinned_cluster.set(null);
+          if (store.selection_kind.get() === 'nbhd_cluster') {
+            setDerivedState(store, { focus: '', highlights: [], edges: [], kind: null });
+            lastActionKey = null;
+          }
+          scheduleRender();
+          log(store, 'nbhd click -> unpin');
+          return;
+        }
+        const hl = highlightsForNbhdCluster(cid, store);
+        if (!hl.length) {
+          store.pinned_cluster.set(null);
+          scheduleRender();
+          log(store, 'nbhd click: no stations in cluster', cid);
+          return;
+        }
+        store.pinned_cluster.set(cid);
         const hadSel = Boolean(store.focus.get())
           || (store.highlights.get() || []).length > 0
           || (store.edges.get() || []).length > 0;
         if (hadSel) {
-          setDerivedState(store, { focus: '', highlights: [], edges: [] });
+          setDerivedState(store, { focus: '', highlights: [], edges: [], kind: null });
           lastActionKey = null;
           model.set('click_info', {});
           model.set('matrix_axis_slice', {});
           model.save_changes();
         }
+        setDerivedState(store, {
+          focus: '',
+          highlights: hl,
+          edges: [],
+          kind: 'nbhd_cluster',
+        });
+        lastActionKey = null;
+        // Drop any lingering row/col axis slice so the next
+        // computeStateFromInputs pass doesn't re-apply a stale `row_col`
+        // focus and wipe this NBHD selection.
+        model.set('matrix_axis_slice', {});
+        model.save_changes();
         scheduleRender();
-        log(store, 'nbhd click -> pin', next);
+        log(store, 'nbhd click -> pin + dendro-style rides', cid, 'stations', hl.length);
       },
     });
 

@@ -45255,6 +45255,9 @@ var createStore = () => ({
   //   'cat_value'     — manual category selection (treated like col_dendro
   //                      since the natural interpretation is "rides
   //                      starting from any of these stations")
+  //   'nbhd_cluster'  — NBHD polygon click: same station set + ride semantics
+  //                      as dendrogram (transition_topk outgoing + incoming
+  //                      mix), not edge_index flow lines or hub red/blue fill
   selection_kind: Observable(null),
   deck_check: Observable({ inputs: true, computed: true, layers: true }),
   deck_ready: Observable(false),
@@ -45296,6 +45299,17 @@ var log3 = (store, ...args) => {
   if (store.debug.get()) console.log("[bike-map]", ...args);
 };
 var MAP_STATION_SLICE_TOP_K = 30;
+function highlightsForNbhdCluster(clusterId, store) {
+  const stations = store.stations.get() || [];
+  const h2 = [];
+  for (const s2 of stations) {
+    if (Number(s2.cluster_id) === Number(clusterId)) {
+      const n2 = String(s2.name || "").trim();
+      if (n2) h2.push(n2);
+    }
+  }
+  return h2;
+}
 function pushRowColMatrixSliceRequest(model, rowIndex, colIndex) {
   if (!model?.set) return;
   const req_id = typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `r${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -45516,8 +45530,8 @@ function targetRidesPoolSize(nRides, kind, focusCtx, totalStations) {
   if (NARROW_FOCUS_KINDS.has(kind)) {
     return Math.max(RIDES_FOCUSED_MIN, Math.round(n2 * RIDES_FOCUSED_FRACTION));
   }
-  if (focusCtx && (focusCtx.mode === "col_dendro" || focusCtx.mode === "row_dendro")) {
-    const selSize = focusCtx.mode === "col_dendro" ? focusCtx.origin?.names?.length || 0 : focusCtx.dest?.names?.length || 0;
+  if (focusCtx && (focusCtx.mode === "col_dendro" || focusCtx.mode === "row_dendro" || focusCtx.mode === "nbhd_cluster")) {
+    const selSize = focusCtx.mode === "col_dendro" ? focusCtx.origin?.names?.length || 0 : focusCtx.mode === "row_dendro" ? focusCtx.dest?.names?.length || 0 : focusCtx.memberCount | 0;
     const total = Math.max(1, Number(totalStations) || 0);
     if (selSize > 0) {
       const frac = Math.min(1, selSize / total);
@@ -45756,6 +45770,60 @@ function buildFocusedRideContext({
     if (!dest) return null;
     return { mode: "row_dendro", dest, originByDest };
   }
+  if (kind === "nbhd_cluster") {
+    const sel = (highlights || []).filter(has);
+    if (sel.length === 0) return null;
+    const memberCount = sel.length;
+    const useOutflow = stationOutflow && Object.keys(stationOutflow).length > 0;
+    const originPairs = sel.map((n2) => [n2, useOutflow ? Number(stationOutflow[n2]) || 1 : 1]);
+    const origin = buildWeightedCdf(originPairs, posLookup);
+    const destByOrigin = /* @__PURE__ */ new Map();
+    for (const o2 of sel) {
+      const entries = (transitionTopk || {})[o2];
+      if (!Array.isArray(entries) || entries.length === 0) continue;
+      const cdf = buildWeightedCdf(
+        entries.filter((row) => row && row[0] !== o2).map((row) => [String(row[0]), Number(row[1]) || 0]),
+        posLookup
+      );
+      if (cdf) destByOrigin.set(o2, cdf);
+    }
+    const selSet = new Set(sel);
+    const inflowByDest = /* @__PURE__ */ new Map();
+    for (const d2 of sel) inflowByDest.set(d2, []);
+    for (const [oorigin, entries] of Object.entries(transitionTopk || {})) {
+      if (!Array.isArray(entries) || entries.length === 0) continue;
+      if (!has(oorigin)) continue;
+      for (const row of entries) {
+        const dest = String(row?.[0] || "");
+        if (!selSet.has(dest) || dest === oorigin) continue;
+        const w2 = Number(row?.[1]) || 0;
+        if (w2 <= 0) continue;
+        inflowByDest.get(dest).push([oorigin, w2]);
+      }
+    }
+    const originByDest = /* @__PURE__ */ new Map();
+    const destPairs = [];
+    for (const d2 of sel) {
+      const cdf = buildWeightedCdf(inflowByDest.get(d2) || [], posLookup);
+      if (!cdf) continue;
+      originByDest.set(d2, cdf);
+      destPairs.push([d2, cdf.total]);
+    }
+    const dest_cdf = buildWeightedCdf(destPairs, posLookup);
+    const colOk = Boolean(origin && destByOrigin.size > 0);
+    const rowOk = Boolean(dest_cdf && originByDest.size > 0);
+    if (!colOk && !rowOk) return null;
+    return {
+      mode: "nbhd_cluster",
+      memberCount,
+      colOk,
+      rowOk,
+      origin: colOk ? origin : null,
+      destByOrigin: colOk ? destByOrigin : null,
+      dest: rowOk ? dest_cdf : null,
+      originByDest: rowOk ? originByDest : null
+    };
+  }
   return null;
 }
 function spawnFocusedRide(focusCtx, posLookup, paletteRgb, stationCluster) {
@@ -45792,6 +45860,46 @@ function spawnFocusedRide(focusCtx, posLookup, paletteRgb, stationCluster) {
     if (!cdf) return null;
     from = pickFromCdfArr(cdf.names, cdf.cum, cdf.total);
     to = d2;
+  } else if (focusCtx.mode === "nbhd_cluster") {
+    const { colOk, rowOk, origin, destByOrigin, dest, originByDest } = focusCtx;
+    if (!colOk && !rowOk) return null;
+    if (colOk && !rowOk) {
+      const o2 = pickFromCdfArr(origin.names, origin.cum, origin.total);
+      if (!o2) return null;
+      const cdf = destByOrigin.get(o2);
+      if (!cdf) return null;
+      from = o2;
+      to = pickFromCdfArr(cdf.names, cdf.cum, cdf.total);
+    } else if (!colOk && rowOk) {
+      const d2 = pickFromCdfArr(dest.names, dest.cum, dest.total);
+      if (!d2) return null;
+      const cdf = originByDest.get(d2);
+      if (!cdf) return null;
+      from = pickFromCdfArr(cdf.names, cdf.cum, cdf.total);
+      to = d2;
+    } else {
+      let colMass = 0;
+      for (const cdf of destByOrigin.values()) colMass += cdf.total;
+      let rowMass = 0;
+      for (const cdf of originByDest.values()) rowMass += cdf.total;
+      const mass = colMass + rowMass;
+      if (mass <= 0) return null;
+      if (Math.random() * mass < colMass) {
+        const o2 = pickFromCdfArr(origin.names, origin.cum, origin.total);
+        if (!o2) return null;
+        const cdf = destByOrigin.get(o2);
+        if (!cdf) return null;
+        from = o2;
+        to = pickFromCdfArr(cdf.names, cdf.cum, cdf.total);
+      } else {
+        const d2 = pickFromCdfArr(dest.names, dest.cum, dest.total);
+        if (!d2) return null;
+        const cdf = originByDest.get(d2);
+        if (!cdf) return null;
+        from = pickFromCdfArr(cdf.names, cdf.cum, cdf.total);
+        to = d2;
+      }
+    }
   }
   if (!from || !to || !posLookup[from] || !posLookup[to]) return null;
   const cid = stationCluster?.get(from);
@@ -45955,7 +46063,7 @@ function render({ model, el }) {
   colToggles.appendChild(makeToggle("Stations", store.show_stations, "show_stations"));
   colToggles.appendChild(makeToggle("Rides", store.show_rides, "show_rides"));
   const SLIDER_LABEL_W = 88;
-  const SLIDER_INPUT_W = 120;
+  const SLIDER_INPUT_W = 96;
   const makeSliderRow = (label) => {
     const row = document.createElement("div");
     row.style.cssText = "display:flex;align-items:center;gap:6px;height:" + TOPBAR_ROW_HEIGHT + "px;min-width:0;";
@@ -46122,13 +46230,16 @@ function render({ model, el }) {
     const focus = store.focus.get();
     const out = /* @__PURE__ */ new Map();
     const inn = /* @__PURE__ */ new Map();
-    if (!focus) return { out, inn };
-    for (const e2 of store.edges.get() || []) {
-      if (e2.direction === "out" && e2.source_name === focus) {
-        out.set(e2.target_name, Number(e2.weight) || 0);
-      } else if (e2.direction === "in" && e2.target_name === focus) {
-        inn.set(e2.source_name, Number(e2.weight) || 0);
+    const edges = store.edges.get() || [];
+    if (focus) {
+      for (const e2 of edges) {
+        if (e2.direction === "out" && e2.source_name === focus) {
+          out.set(e2.target_name, Number(e2.weight) || 0);
+        } else if (e2.direction === "in" && e2.target_name === focus) {
+          inn.set(e2.source_name, Number(e2.weight) || 0);
+        }
       }
+      return { out, inn };
     }
     return { out, inn };
   };
@@ -46140,6 +46251,9 @@ function render({ model, el }) {
     const seq = linkInteractionSeq;
     log3(store, "compute start", t2, "rows", (store.selected_rows.get() || []).length, "cols", (store.selected_cols.get() || []).length);
     const setState = (focus, highlights, edges) => setDerivedState(store, { focus, highlights, edges });
+    const releasePinnedNbhd = () => {
+      if (store.pinned_cluster.get() != null) store.pinned_cluster.set(null);
+    };
     const stationFrom = (raw) => {
       const txt = String(raw || "").trim();
       if (idx[txt]) return txt;
@@ -46158,6 +46272,7 @@ function render({ model, el }) {
     }
     const acoord = (n2) => n2 && idx[n2]?.coord || (n2 ? coordMap[n2] : void 0);
     if (t2 === "row_label" || t2 === "col_label") {
+      releasePinnedNbhd();
       const name2 = stationFrom(v2.name);
       const actionKey = `${t2}:${name2}`;
       if (actionKey === lastActionKey && seq !== lastActionSeq) {
@@ -46245,6 +46360,7 @@ function render({ model, el }) {
       return;
     }
     if (t2 === "mat_value") {
+      releasePinnedNbhd();
       const row = stationFrom((v2.row || {}).name);
       const col = stationFrom((v2.col || {}).name);
       const actionKey = `mat:${col}->${row}`;
@@ -46284,6 +46400,7 @@ function render({ model, el }) {
       return;
     }
     if (t2 === "row_dendro" || t2 === "col_dendro") {
+      releasePinnedNbhd();
       const hasStation = (n2) => Boolean(n2 && (idx[n2] || coordMap[n2]));
       const fromClick = (v2.selected_names || []).map(stationFrom).filter(hasStation);
       const rows = (store.selected_rows.get() || []).map(stationFrom).filter(hasStation);
@@ -46304,6 +46421,7 @@ function render({ model, el }) {
       return;
     }
     if (t2 === "cat_value") {
+      releasePinnedNbhd();
       const axis = v2.axis;
       const attrIndex = v2.attr_index;
       const catVal = v2.value;
@@ -46325,6 +46443,7 @@ function render({ model, el }) {
     }
     const slPair = store.matrix_axis_slice.get() || {};
     if (slPair.slice_kind === "row_col") {
+      releasePinnedNbhd();
       const primaryRaw = slPair.row_axis?.primary_name ?? slPair.col_axis?.primary_name ?? null;
       if (!primaryRaw) return;
       const focusName = stationFrom(primaryRaw);
@@ -46422,6 +46541,8 @@ function render({ model, el }) {
         sig += `|out:${focusCtx.origin.names.slice().sort().join(",")}`;
       } else if (focusCtx.mode === "row_dendro") {
         sig += `|in:${focusCtx.dest.names.slice().sort().join(",")}`;
+      } else if (focusCtx.mode === "nbhd_cluster") {
+        sig += `|nbhd:${focusCtx.memberCount}|c${focusCtx.colOk ? 1 : 0}r${focusCtx.rowOk ? 1 : 0}`;
       }
     } else if (focusName) {
       sig += `|${focusName}`;
@@ -46441,7 +46562,7 @@ function render({ model, el }) {
     refillRides(ridesPool, ridesSampler, focus || null, posLookup, palRgb, stationCluster, focusCtx);
     ridesFrame += 1;
     const ridesAlpha = Math.round(220 * Math.max(0, 1 - spatialMix));
-    const RIDES_STROKE_MODES = /* @__PURE__ */ new Set(["col_dendro", "row_dendro"]);
+    const RIDES_STROKE_MODES = /* @__PURE__ */ new Set(["col_dendro", "row_dendro", "nbhd_cluster"]);
     const stroked = Boolean(focusCtx && RIDES_STROKE_MODES.has(focusCtx.mode));
     const strokeAlpha = Math.round(180 * Math.max(0, 1 - spatialMix));
     return new scatterplot_layer_default({
@@ -46481,6 +46602,7 @@ function render({ model, el }) {
     const highlightArr = store.highlights.get() || [];
     const highlights = new Set(highlightArr);
     const edges = store.edges.get() || [];
+    const selectionKind = store.selection_kind.get();
     const stationNameSet = new Set(stations.map((d2) => d2.name));
     const overlap = highlightArr.filter((n3) => stationNameSet.has(n3));
     log3(store, "buildLayers", {
@@ -46542,7 +46664,7 @@ function render({ model, el }) {
     const highlightKey = Array.from(highlights).sort().join("|");
     const outKey = Array.from(out.entries()).map(([k2, v2]) => `${k2}:${v2}`).sort().join("|");
     const inKey = Array.from(inn.entries()).map(([k2, v2]) => `${k2}:${v2}`).sort().join("|");
-    const styleKey = `${focus}__${highlightKey}__${outKey}__${inKey}__${hasSel}__${spatialMix}__${hoveredCluster}__${pinnedCluster}`;
+    const styleKey = `${focus}__${highlightKey}__${outKey}__${inKey}__${hasSel}__${spatialMix}__${hoveredCluster}__${pinnedCluster}__${selectionKind || ""}`;
     let peakLinkWeight = 0;
     for (const v2 of out.values()) peakLinkWeight = Math.max(peakLinkWeight, v2);
     for (const v2 of inn.values()) peakLinkWeight = Math.max(peakLinkWeight, v2);
@@ -46662,17 +46784,43 @@ function render({ model, el }) {
         const cid = Number(info.object.cluster_id);
         const current = store.pinned_cluster.get();
         const next = current === cid ? null : cid;
-        store.pinned_cluster.set(next);
+        if (next == null) {
+          store.pinned_cluster.set(null);
+          if (store.selection_kind.get() === "nbhd_cluster") {
+            setDerivedState(store, { focus: "", highlights: [], edges: [], kind: null });
+            lastActionKey = null;
+          }
+          scheduleRender();
+          log3(store, "nbhd click -> unpin");
+          return;
+        }
+        const hl = highlightsForNbhdCluster(cid, store);
+        if (!hl.length) {
+          store.pinned_cluster.set(null);
+          scheduleRender();
+          log3(store, "nbhd click: no stations in cluster", cid);
+          return;
+        }
+        store.pinned_cluster.set(cid);
         const hadSel = Boolean(store.focus.get()) || (store.highlights.get() || []).length > 0 || (store.edges.get() || []).length > 0;
         if (hadSel) {
-          setDerivedState(store, { focus: "", highlights: [], edges: [] });
+          setDerivedState(store, { focus: "", highlights: [], edges: [], kind: null });
           lastActionKey = null;
           model.set("click_info", {});
           model.set("matrix_axis_slice", {});
           model.save_changes();
         }
+        setDerivedState(store, {
+          focus: "",
+          highlights: hl,
+          edges: [],
+          kind: "nbhd_cluster"
+        });
+        lastActionKey = null;
+        model.set("matrix_axis_slice", {});
+        model.save_changes();
         scheduleRender();
-        log3(store, "nbhd click -> pin", next);
+        log3(store, "nbhd click -> pin + dendro-style rides", cid, "stations", hl.length);
       }
     });
     const pointData = stations.map((d2) => d2);
@@ -46828,9 +46976,9 @@ function render({ model, el }) {
       const palRgb2 = resolvePaletteRgb(store);
       const stationCluster = /* @__PURE__ */ new Map();
       for (const s2 of stations) stationCluster.set(s2.name, Number(s2.cluster_id) || 0);
-      const selectionKind = store.selection_kind.get();
-      const focusCtx = selectionKind ? buildFocusedRideContext({
-        kind: selectionKind,
+      const selectionKind2 = store.selection_kind.get();
+      const focusCtx = selectionKind2 ? buildFocusedRideContext({
+        kind: selectionKind2,
         focus,
         highlights: highlightArr,
         edges,
@@ -46841,10 +46989,10 @@ function render({ model, el }) {
       const isFocused = Boolean(focusCtx);
       const nRidesSlider = Number(store.n_rides.get());
       resizeRidesPool(
-        targetRidesPoolSize(nRidesSlider, selectionKind, focusCtx, stations.length)
+        targetRidesPoolSize(nRidesSlider, selectionKind2, focusCtx, stations.length)
       );
       ensureSampler(transitionTopk, stationOutflow);
-      flushRidesForSelectionChange(selectionKind, focus, focusCtx);
+      flushRidesForSelectionChange(selectionKind2, focus, focusCtx);
       ridesCtx = {
         posLookup,
         palRgb: palRgb2,
