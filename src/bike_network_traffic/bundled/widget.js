@@ -45278,6 +45278,9 @@ var createStore = () => ({
   // synced to Python traitlets — they tweak the visual treatment without
   // changing the semantic state of the map.
   station_size_mult: Observable(1),
+  // Keep the geographic context present but subdued by default, so the
+  // stations, rides, and neighborhoods remain the visual focus.
+  basemap_opacity_mult: Observable(0.1),
   nbhd_opacity_mult: Observable(0.4),
   // Animated bike-ride simulation. transition_topk is a sparse top-K
   // destination distribution per origin (shipped from Python);
@@ -45375,7 +45378,7 @@ var setDerivedState = (store, { focus, highlights, edges, kind }) => {
 function basemapLayer(opacity = 255) {
   return new tile_layer_default({
     id: "bike-basemap",
-    data: "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
+    data: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
     minZoom: 0,
     maxZoom: 19,
     tileSize: 256,
@@ -46034,6 +46037,13 @@ function render({ model, el }) {
   const mapHolder = document.createElement("div");
   mapHolder.style.cssText = "flex:1 1 auto;position:relative;background:#e2e4e8;transition:background-color 200ms;";
   root.appendChild(mapHolder);
+  const attribution = document.createElement("a");
+  attribution.href = "https://www.openstreetmap.org/copyright";
+  attribution.target = "_blank";
+  attribution.rel = "noopener";
+  attribution.textContent = "\xA9 OpenStreetMap contributors";
+  attribution.style.cssText = "position:absolute;right:4px;bottom:4px;z-index:2;padding:1px 4px;border-radius:2px;background:rgba(255,255,255,0.82);color:#333;font:10px/14px system-ui,sans-serif;text-decoration:none;";
+  mapHolder.appendChild(attribution);
   const styleToggleButton = (btn, on) => {
     btn.style.background = on ? "#1f77b4" : "#fff";
     btn.style.color = on ? "#fff" : "#444";
@@ -46140,6 +46150,16 @@ function render({ model, el }) {
     radiusRow.row.style.opacity = on ? "1" : "0.4";
     radiusRow.input.disabled = !on;
   }, { immediate: true });
+  const mapRow = makeSliderRow("Map");
+  mapRow.input.min = "0";
+  mapRow.input.max = "1";
+  mapRow.input.step = "0.05";
+  mapRow.input.value = String(store.basemap_opacity_mult.get());
+  mapRow.input.addEventListener("input", () => {
+    store.basemap_opacity_mult.set(parseFloat(mapRow.input.value));
+    scheduleRender();
+  });
+  colNbhd.appendChild(mapRow.row);
   const opacityRow = makeSliderRow("Opacity");
   opacityRow.input.min = "0";
   opacityRow.input.max = "1";
@@ -47006,7 +47026,11 @@ function render({ model, el }) {
       ridesCtx = { ...ridesCtx, available: false };
       lastRidesFrameTs = 0;
     }
-    const basemapAlpha = Math.round(255 * (1 - spatialMix));
+    const basemapOpacity = Math.max(
+      0,
+      Math.min(1, Number(store.basemap_opacity_mult.get()) || 0)
+    );
+    const basemapAlpha = Math.round(255 * basemapOpacity * (1 - spatialMix));
     const nonRides = [basemapLayer(basemapAlpha), polygons, lines, points];
     cachedNonRidesLayers = nonRides;
     if (ridesCtx.available) {
@@ -47119,6 +47143,7 @@ function render({ model, el }) {
     store.show_stations,
     store.pinned_cluster,
     store.station_size_mult,
+    store.basemap_opacity_mult,
     store.nbhd_opacity_mult,
     store.transition_topk,
     store.station_outflow,

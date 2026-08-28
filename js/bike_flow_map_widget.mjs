@@ -70,6 +70,9 @@ const createStore = () => ({
   // synced to Python traitlets — they tweak the visual treatment without
   // changing the semantic state of the map.
   station_size_mult: Observable(1.0),
+  // Keep the geographic context present but subdued by default, so the
+  // stations, rides, and neighborhoods remain the visual focus.
+  basemap_opacity_mult: Observable(0.1),
   nbhd_opacity_mult: Observable(0.4),
   // Animated bike-ride simulation. transition_topk is a sparse top-K
   // destination distribution per origin (shipped from Python);
@@ -191,7 +194,7 @@ const setDerivedState = (store, { focus, highlights, edges, kind }) => {
 function basemapLayer(opacity = 255) {
   return new TileLayer({
     id: 'bike-basemap',
-    data: 'https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
+    data: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
     minZoom: 0,
     maxZoom: 19,
     tileSize: 256,
@@ -1009,10 +1012,11 @@ function render({ model, el }) {
     'background:#e2e4e8;border-radius:4px;overflow:hidden;display:flex;flex-direction:column;';
   el.appendChild(root);
 
-  // Topbar = three horizontal sections, each a vertical stack of two controls.
+  // Topbar = three horizontal sections, each a vertical stack of controls.
   //   [ Toggles ]  |  [ Station/Spatial sliders ]  |  [ NBHD sliders ]
   //   NBHD on top     Spatial ↔ UMAP on top         Radius on top
-  //   Stations below  Size below                    Opacity below
+  //   Stations below  Size below                    Map below
+  //   Rides below     Rides below                   Opacity below
   // Grouping by domain (toggles vs station-related sliders vs nbhd-related
   // sliders) keeps related controls visually adjacent and lets each row
   // share a consistent label width within its column.
@@ -1020,7 +1024,7 @@ function render({ model, el }) {
   // Buttons are smaller than slider rows — a slider needs vertical room
   // for its thumb, a button doesn't. Toggle column has 3 stacked
   // buttons; slider columns now hold up to 3 rows (Spatial↔UMAP / Size /
-  // Rides in the station column; Radius / Opacity in the NBHD column).
+  // Rides in the station column; Radius / Map / Opacity in the right column).
   // The topbar is sized to fit 3 slider rows + gap + padding; the toggle
   // column distributes its 3 buttons via justify-content: space-between
   // so they spread evenly across the same height.
@@ -1063,6 +1067,18 @@ function render({ model, el }) {
   mapHolder.style.cssText =
     'flex:1 1 auto;position:relative;background:#e2e4e8;transition:background-color 200ms;';
   root.appendChild(mapHolder);
+
+  // Required attribution for the OpenStreetMap Standard tile service.
+  const attribution = document.createElement('a');
+  attribution.href = 'https://www.openstreetmap.org/copyright';
+  attribution.target = '_blank';
+  attribution.rel = 'noopener';
+  attribution.textContent = '\u00a9 OpenStreetMap contributors';
+  attribution.style.cssText =
+    'position:absolute;right:4px;bottom:4px;z-index:2;padding:1px 4px;' +
+    'border-radius:2px;background:rgba(255,255,255,0.82);color:#333;' +
+    'font:10px/14px system-ui,sans-serif;text-decoration:none;';
+  mapHolder.appendChild(attribution);
 
   const styleToggleButton = (btn, on) => {
     btn.style.background = on ? '#1f77b4' : '#fff';
@@ -1158,7 +1174,7 @@ function render({ model, el }) {
     sizeRow.input.disabled = !on;
   }, { immediate: true });
 
-  // ---- NBHD column: alpha-shape Radius (top), Opacity (bottom) ----
+  // ---- Right column: alpha-shape Radius, basemap opacity, NBHD opacity ----
   // Radius slider indexes into cluster_polygons.levels_miles. Hidden when
   // no neighborhoods are precomputed for this city.
   const radiusRow = makeSliderRow('Radius');
@@ -1190,6 +1206,18 @@ function render({ model, el }) {
     radiusRow.row.style.opacity = on ? '1' : '0.4';
     radiusRow.input.disabled = !on;
   }, { immediate: true });
+
+  // Basemap opacity is independent of the neighborhood toggle. Its default of
+  // 0.1 makes dense station/rides views easier to read while retaining street
+  // and water context beneath them.
+  const mapRow = makeSliderRow('Map');
+  mapRow.input.min = '0'; mapRow.input.max = '1'; mapRow.input.step = '0.05';
+  mapRow.input.value = String(store.basemap_opacity_mult.get());
+  mapRow.input.addEventListener('input', () => {
+    store.basemap_opacity_mult.set(parseFloat(mapRow.input.value));
+    scheduleRender();
+  });
+  colNbhd.appendChild(mapRow.row);
 
   // Opacity slider: full range 0 → 1 so the user can make NBHDs entirely
   // transparent or fully opaque. Default 0.4 lands on the subtle look that
@@ -2256,7 +2284,13 @@ function render({ model, el }) {
       lastRidesFrameTs = 0;
     }
 
-    const basemapAlpha = Math.round(255 * (1 - spatialMix));
+    const basemapOpacity = Math.max(
+      0,
+      Math.min(1, Number(store.basemap_opacity_mult.get()) || 0),
+    );
+    // The Map slider controls geographic context at spatial_mix=0; as the
+    // layout morphs into UMAP, the basemap still fades out completely.
+    const basemapAlpha = Math.round(255 * basemapOpacity * (1 - spatialMix));
     // Non-rides layers in render order. We cache this so the rides rAF
     // can append a fresh rides layer without redoing the work above.
     const nonRides = [basemapLayer(basemapAlpha), polygons, lines, points];
@@ -2396,6 +2430,7 @@ function render({ model, el }) {
     store.show_stations,
     store.pinned_cluster,
     store.station_size_mult,
+    store.basemap_opacity_mult,
     store.nbhd_opacity_mult,
     store.transition_topk,
     store.station_outflow,
