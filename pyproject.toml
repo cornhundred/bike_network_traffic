@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "bike_network_traffic"
 version = "0.1.1"
 description = "Jupyter anywidget: deck.gl bike station flow map linked to Celldega clustergrams"
-requires-python = ">=3.10"
+requires-python = ">=3.11,<3.13"
 license = "MIT"
 authors = [{ name = "bike_network_traffic contributors" }]
 keywords = ["jupyter", "widget", "anywidget", "deck.gl", "bikes"]
@@ -15,10 +15,8 @@ classifiers = [
   "Intended Audience :: Science/Research",
   "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
-  "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
   "anywidget>=0.9.0",
@@ -26,7 +24,7 @@ dependencies = [
   "traitlets>=5.0",
   "jupyterlab>=4.0",
   "pandas>=2.0",
-  "celldega==0.16.0a5",
+  "celldega==0.25.0a1",
   # celldega -> spatialdata -> xarray_schema imports the deprecated
   # `pkg_resources`, which lived inside setuptools but was REMOVED in
   # setuptools 81+. Pin below 81 until xarray_schema upstream stops

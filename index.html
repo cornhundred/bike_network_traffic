@@ -40,7 +40,9 @@
     font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     -webkit-font-smoothing: antialiased;
   }
-  main { max-width: 1300px; margin: 0 auto; padding: 48px 32px 96px; }
+  /* The linked widget is 1,280px wide (560px map + 720px Clustergram).
+     Leave enough room for its controls without horizontal clipping. */
+  main { max-width: 1440px; margin: 0 auto; padding: 48px 32px 96px; }
   header { margin-bottom: 24px; }
   h1 {
     font-size: 2.25rem;
